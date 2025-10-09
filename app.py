@@ -14,6 +14,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 # --- colorama (opsiyonel, yoksa sade çıktı) ---
+
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
@@ -35,21 +36,21 @@ MODEL_NAME       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 N_WORKERS        = 12
 LIMIT_TOTAL      = None          # tamamını işle (kısa test için 100 gibi ver)
-BATCH_READ       = 4096
-BATCH_ENCODE     = 32
+BATCH_READ       = 16384
+BATCH_ENCODE     = 96
 MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
-MAX_TEXT_CHARS   = 2000          # HIZ için metni kırp (None yaparsan kırpmaz)
+MAX_TEXT_CHARS   = 3000          # HIZ için metni kırp (None yaparsan kırpmaz)
 
 TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
 URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 
-Q_R2W_SIZE       = 4096          # büyük kuyruklar → daha akıcı pipeline
-Q_W2WR_SIZE      = 4096
+Q_R2W_SIZE       = 15000          # büyük kuyruklar → daha akıcı pipeline
+Q_W2WR_SIZE      = 15000
 
 FLUSH_EVERY      = 5000          # writer checkpoint (vektör)
-FLUSH_INTERVAL_S = 30            # writer checkpoint (saniye)
+FLUSH_INTERVAL_S = 60            # writer checkpoint (saniye)
 
 PROCESSED_FILE   = "processed_files.txt"  # dosya-bazlı resume için
 LOG_FILE         = None           # "logs/ingest.log" yazarsan dosyaya da loglar
@@ -144,7 +145,7 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
             mark_processed(path)
             continue
 
-        scanner = ds_.scanner(columns=[tcol] + ([ucol] if ucol else []), batch_size=BATCH_READ)
+        scanner = ds_.scanner(columns=[tcol] + ([ucol] if ucol else []), batch_size=BATCH_READ,use_threads=True)
         for b in scanner.to_batches():
             if stop_event.is_set(): break
             d = b.to_pydict()
@@ -189,7 +190,7 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         if stop_event.is_set():
             if batch_texts:
                 vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float32)
+                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
                 processed += len(batch_texts)
                 # bellek temizliği
@@ -205,7 +206,7 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         if item is None:
             if batch_texts:
                 vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float32)
+                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
                 processed += len(batch_texts)
                 del vecs; gc.collect()
@@ -218,7 +219,7 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
 
         if len(batch_texts) >= BATCH_ENCODE:
             vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                show_progress_bar=False, normalize_embeddings=True).astype(np.float32)
+                                show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
             out_q.put((vecs, batch_texts, batch_urls))
             processed += len(batch_texts)
             # reset & bellek temizliği
@@ -292,6 +293,11 @@ def writer(in_q: Queue, stop_event: Event):
             continue
 
         vecs, texts, urls = item
+        vecs = np.asarray(vecs)
+        if vecs.dtype == np.float16:
+            vecs = vecs.astype(np.float32)
+
+        
         received_total += len(texts)
 
         # DUP GUARD
