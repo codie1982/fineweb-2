@@ -42,7 +42,7 @@ MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
 MAX_TEXT_CHARS   = 3000          # HIZ için metni kırp (None yaparsan kırpmaz)
-
+MAX_SEG_LENGTH   = 256
 TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
 URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 
@@ -100,6 +100,7 @@ def preload_model():
     if MODEL is None:
         log("Model yükleniyor… (tek sefer)", "SYS", Fore.CYAN)
         MODEL = SentenceTransformer(MODEL_NAME)
+        MODEL.max_seq_length = MAX_SEG_LENGTH
         MODEL.eval()
         log("Model hazır.", "SYS", Fore.CYAN)
 

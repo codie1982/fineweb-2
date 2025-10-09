@@ -219,3 +219,4 @@ __marimo__/
 /fineweb-2
 faiss.index
 meta.json
+*.tmp
