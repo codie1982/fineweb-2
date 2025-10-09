@@ -1,0 +1,15 @@
+flask==2.3.3
+flask-cors==4.0.0
+sentence-transformers==3.0.1  # Upgrade to a newer version
+transformers==4.41.2
+huggingface_hub==0.23.0
+torch==2.7.1
+scipy==1.14.1
+numpy==2.1.2
+gunicorn==21.2.0
+python-dotenv==1.0.1
+crawl4ai==0.6.3
+nest_asyncio==1.5.6
+
+faiss-cpu==1.10.0
+playwright>=1.49.0
