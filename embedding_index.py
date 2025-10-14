@@ -1,3 +1,12 @@
+# -*- coding: utf-8 -*-
+"""
+EmbeddingIndex – FAISS + SentenceTransformer tabanlı metin indeksleme sistemi
+- Otomatik chunking (parametrik boyut & overlap)
+- Her chunk için ayrı embedding
+- Orijinal metni meta.json içinde saklama
+- SHA1, URL, doc_type, chunk_index bilgileri dahil
+"""
+
 import os
 import re
 import json
@@ -13,11 +22,6 @@ from sentence_transformers import SentenceTransformer
 
 
 class EmbeddingIndex:
-    """
-    Tüm embedding + FAISS + metin işleme mantığını kapsar.
-    Flask router'ları bu sınıfı kullanır.
-    """
-
     def __init__(
         self,
         model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
@@ -28,91 +32,97 @@ class EmbeddingIndex:
         self.index_path = index_path
         self.meta_path = meta_path
 
-        # Paylaşımlı kilit; Flask çoklu thread altında güvenli erişim
         self._lock = threading.Lock()
-
-        # FAISS + meta durumları
         self.index: Optional[faiss.IndexIDMap2] = None
         self.meta: Dict[int, Dict[str, Any]] = {}
         self._next_int_id: int = 1
 
-        # Modeli baştan yükle
         self.model = SentenceTransformer(self.model_name)
         self.model.eval()
-        # Kalıcı durumu getir
+
         try:
             self._load_state()
         except Exception:
-            # İlk kurulumda dosyalar yoksa sessizce devam
             pass
 
-    # ---------- Public API ----------
-
-    def vectorize_text(self, text: str) -> List[float]:
-        """Metni embed edip Python list olarak döndürür."""
-        if not text or not text.strip():
-            raise ValueError("No text provided")
-        vec = self.model.encode(text)
-        return vec.tolist()
+    # =====================================================
+    # ✅ GENEL API
+    # =====================================================
 
     def upsert_vector(
         self,
         text: Optional[str],
-        vector: Optional[List[float]],
-        external_id: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-        int_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        vector: Optional[List[float]] = None,
+        external_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        chunk_size: int = 1500,
+        overlap: int = 200,
+    ) -> List[Dict[str, Any]]:
         """
-        Tek bir vektörü FAISS'e ekler/günceller.
-        text verilirse encode edilir; vector verilirse direkt kullanılır.
+        Uzun bir text'i chunk'lara bölerek FAISS'e ekler.
+        Her chunk ayrı embedding olarak kaydedilir.
+        Orijinal metin metadata içinde 'full_text' olarak saklanır.
         """
-        if vector is None:
-            if not text or not text.strip():
-                raise ValueError("Provide either 'text' or 'vector'.")
-            v = self.model.encode(text)
-        else:
-            v = np.array(vector, dtype=np.float32)
+        if not text or not text.strip():
+            raise ValueError("Provide 'text' or 'vector'")
 
-        if not isinstance(v, np.ndarray):
-            v = np.array(v, dtype=np.float32)
-        if v.ndim == 1:
-            v = v.reshape(1, -1).astype(np.float32)
+        full_text_sha1 = self._sha1_of(text)
+        results = []
 
-        dim = v.shape[1]
+        # 1️⃣ Chunk'lara böl
+        chunks = self._chunk_text_simple(text, size=chunk_size, overlap=overlap)
+        total_chunks = len(chunks)
 
         with self._lock:
-            self._ensure_index(dim)
-            self._normalize(v)
+            for idx, chunk in enumerate(chunks):
+                v = self.model.encode(chunk)
+                if not isinstance(v, np.ndarray):
+                    v = np.array(v, dtype=np.float32)
+                if v.ndim == 1:
+                    v = v.reshape(1, -1)
 
-            if int_id is None:
-                int_id = self._next_int_id
+                dim = v.shape[1]
+                self._ensure_index(dim)
+                self._normalize(v)
+
+                chunk_id = self._next_int_id
                 self._next_int_id += 1
-            else:
-                # Varsa eski kaydı çıkar (yoksa FAISS zaten ignore eder)
-                try:
-                    self.index.remove_ids(np.array([int(int_id)], dtype=np.int64))
-                except Exception:
-                    pass
+                self.index.add_with_ids(v, np.array([chunk_id], dtype=np.int64))
 
-            self.index.add_with_ids(v, np.array([int(int_id)], dtype=np.int64))
-            self.meta[int(int_id)] = {
-                "external_id": external_id or str(uuid.uuid4()),
-                "text": text if text else self.meta.get(int(int_id), {}).get("text"),
-                "metadata": metadata or {},
-            }
+                # 🔎 meta bilgisi
+                self.meta[chunk_id] = {
+                    "external_id": external_id or str(uuid.uuid4()),
+                    "text": chunk,
+                    "metadata": {
+                        **(metadata or {}),
+                        "chunk_index": idx,
+                        "total_chunks": total_chunks,
+                        "full_text_sha1": full_text_sha1,
+                        "full_text": text,
+                        "sha1": self._sha1_of(chunk),
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                }
+
+                results.append({
+                    "id": chunk_id,
+                    "external_id": self.meta[chunk_id]["external_id"],
+                    "chunk_index": idx,
+                    "total_chunks": total_chunks,
+                })
+
             self._save_state()
 
-        return {"id": int(int_id), "external_id": self.meta[int(int_id)]["external_id"]}
+        return results
 
     def search(
         self,
-        text: Optional[str],
-        vector: Optional[List[float]],
-        k: int,
+        text: Optional[str] = None,
+        vector: Optional[List[float]] = None,
+        k: int = 5,
         simple_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Metin veya vektörle benzerlik araması yapar, basit metadata filtresi uygular."""
+        """KNN benzerlik araması yapar."""
         if vector is None:
             if not text or not text.strip():
                 return []
@@ -120,10 +130,8 @@ class EmbeddingIndex:
         else:
             q = np.array(vector, dtype=np.float32)
 
-        if not isinstance(q, np.ndarray):
-            q = np.array(q, dtype=np.float32)
         if q.ndim == 1:
-            q = q.reshape(1, -1).astype(np.float32)
+            q = q.reshape(1, -1)
 
         with self._lock:
             if self.index is None or self.index.ntotal == 0:
@@ -134,47 +142,41 @@ class EmbeddingIndex:
 
             self._normalize(q)
             scores, ids = self.index.search(q, int(k))
-            ids = ids[0].tolist()
-            scores = scores[0].tolist()
 
-            out = []
-            for i, idx in enumerate(ids):
+            results = []
+            for i, idx in enumerate(ids[0]):
                 if idx == -1:
                     continue
-                m = self.meta.get(int(idx))
-                if not m:
+                meta = self.meta.get(int(idx))
+                if not meta:
                     continue
 
-                if simple_filter:
-                    if not self._passes_filter(m, simple_filter):
-                        continue
+                if simple_filter and not self._passes_filter(meta, simple_filter):
+                    continue
 
-                out.append(
-                    {
-                        "id": int(idx),
-                        "score": float(scores[i]),
-                        "external_id": m.get("external_id"),
-                        "text": m.get("text"),
-                        "metadata": m.get("metadata", {}),
-                    }
-                )
-        return out
+                results.append({
+                    "id": int(idx),
+                    "score": float(scores[0][i]),
+                    "external_id": meta.get("external_id"),
+                    "text": meta.get("text"),
+                    "metadata": meta.get("metadata", {}),
+                })
+
+        return results
 
     def ingest_markdown(
         self,
         url: str,
         raw_markdown: str,
         doc_type: str = "service",
-        target_chars: int = 1100,
-        overlap_chars: int = 180,
+        chunk_size: int = 1500,
+        overlap: int = 200,
     ) -> Dict[str, Any]:
         """
-        Markdown -> clean -> chunk -> embed -> FAISS add_with_ids
+        Markdown dokümanı temizleyip chunk'lara böler ve FAISS'e ekler.
         """
         if not self._is_valid_url(url):
             raise ValueError("invalid url")
-        if not raw_markdown or not raw_markdown.strip():
-            raise ValueError("empty markdown")
 
         clean_md = self.clean_markdown(raw_markdown)
         content_hash = self._sha1_of(clean_md)
@@ -183,192 +185,84 @@ class EmbeddingIndex:
         if m:
             title = m.group(1).strip()
 
-        raw_chunks = self.chunk_text(clean_md, target=target_chars, overlap=overlap_chars)
+        # 🔥 Chunk işlemi burada
+        chunks = self._chunk_text_simple(clean_md, size=chunk_size, overlap=overlap)
+        total_chunks = len(chunks)
 
         results = []
         with self._lock:
-            if not raw_chunks:
-                page = {"url": url, "title": title, "language": "tr", "content_hash": content_hash}
-                return {
-                    "success": True,
-                    "page": page,
-                    "chunks": [],
-                    "model": {"name": self.model_name},
-                    "index": {"name": "main_flat_ip"},
-                }
+            for idx, chunk in enumerate(chunks):
+                v = self.model.encode(chunk)
+                if v.ndim == 1:
+                    v = v.reshape(1, -1)
 
-            texts = [c[0] for c in raw_chunks]
-            vecs = self.model.encode(texts)
-            vecs = np.array(vecs, dtype=np.float32)
-            if vecs.ndim == 1:
-                vecs = vecs.reshape(1, -1)
+                dim = v.shape[1]
+                self._ensure_index(dim)
+                self._normalize(v)
 
-            dim = vecs.shape[1]
-            self._ensure_index(dim)
-            self._normalize(vecs)
+                cid = self._next_int_id
+                self._next_int_id += 1
+                self.index.add_with_ids(v, np.array([cid], dtype=np.int64))
 
-            start_id = self._next_int_id
-            ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
-            self._next_int_id += vecs.shape[0]
-            self.index.add_with_ids(vecs, ids)
-
-            for i, (txt, s, e, h_path) in enumerate(raw_chunks):
-                faiss_id = int(ids[i])
-                chunk_id = str(uuid.uuid4())
-                self.meta[faiss_id] = {
-                    "external_id": chunk_id,
-                    "text": txt,
-                    "metadata": {"doc_type": doc_type.lower(), "url": url, "h_path": h_path},
-                }
-                results.append(
-                    {
-                        "chunk_id": chunk_id,
-                        "faiss_id": faiss_id,
+                self.meta[cid] = {
+                    "external_id": str(uuid.uuid4()),
+                    "text": chunk,
+                    "metadata": {
+                        "doc_type": doc_type.lower(),
                         "url": url,
-                        "h_path": h_path,
-                        "text": txt,
-                        "char_start": s,
-                        "char_end": e,
-                        "metadata": {"doc_type": doc_type.lower()},
-                    }
-                )
+                        "title": title,
+                        "chunk_index": idx,
+                        "total_chunks": total_chunks,
+                        "full_text": clean_md,
+                        "full_text_sha1": content_hash,
+                        "sha1": self._sha1_of(chunk),
+                    },
+                }
+
+                results.append({
+                    "chunk_index": idx,
+                    "faiss_id": cid,
+                    "url": url,
+                    "text": chunk,
+                })
 
             self._save_state()
 
-        page = {"url": url, "title": title, "language": "tr", "content_hash": content_hash}
         return {
             "success": True,
-            "page": page,
+            "page": {"url": url, "title": title, "language": "tr", "content_hash": content_hash},
             "chunks": results,
-            "model": {"name": self.model_name, "dim": int(vecs.shape[1]), "emb_ver": time.strftime("%Y-%m-%d")},
-            "index": {"name": "main_flat_ip"},
+            "model": {"name": self.model_name, "dim": dim, "emb_ver": time.strftime("%Y-%m-%d")},
         }
 
-    # ---------- Text utils (public) ----------
+    # =====================================================
+    # 🧠 TEXT YARDIMCILARI
+    # =====================================================
 
     @staticmethod
-    def clean_markdown(md: str, one_per_line: bool = True, drop_footers: bool = True) -> str:
-        """Mevcut temizleyicinin birebir taşınmış versiyonu."""
-        if not isinstance(md, str):
-            return ""
-
-        out = md.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-        # (<https://…>) → (https://…)
-        out = re.sub(r"\(<\s*([^>]+)\s*>\)", r"(\1)", out, flags=re.I)
-        # https:/ → https://
-        out = re.sub(r"\b(https?):\/(?!\/)", r"\1://", out, flags=re.I)
-        # [12] başlıkları
-        out = re.sub(r"^\s*\[\d+\]\s*", "", out, flags=re.M)
-
-        # javascript:void(0) ve hash-only
-        def _rm_js_void(m):
-            txt = m.group(1) or ""
-            return txt.strip() if txt.strip() else ""
-
-        out = re.sub(r"\[([^\]]*)\]\(\s*javascript:void\(0\)\s*\)", _rm_js_void, out, flags=re.I)
-
-        def _rm_hash_or_empty(m):
-            txt = m.group(1) or ""
-            return txt.strip() if txt.strip() else ""
-
-        out = re.sub(r"\[([^\]]+)\]\(\s*(#|\s*)\)", _rm_hash_or_empty, out)
-
-        # [](...)
-        out = re.sub(r"\[\s*\]\(\s*[^)]+\s*\)", "", out)
-
-        # [text](url) → "text" (opsiyonel satır başı)
-        def _link_to_text(m):
-            txt = m.group(1)
-            return f"\n{txt}\n" if one_per_line else txt
-
-        out = re.sub(r"\[([^\]]+)\]\(\s*[^)]+\s*\)", _link_to_text, out)
-
-        # resimleri kaldır
-        out = re.sub(r"!\[[^\]]*\]\(\s*[^)]+\s*\)", "", out)
-        # çıplak URL'leri sil
-        out = re.sub(r"\bhttps?://\S+", "", out, flags=re.I)
-
-        # newline/boşluk düzeltmeleri
-        out = re.sub(r"[ \t]+\n", "\n", out)
-        out = re.sub(r"\n[ \t]+", "\n", out)
-
-        lines = [l.strip() for l in out.split("\n")]
-
-        if drop_footers:
-            footer_or_noise = re.compile(
-                "|".join(
-                    [
-                        r"^gizlilik politikası$",
-                        r"^kvkk$",
-                        r"^kullanım koşulları$",
-                        r"^çerez politikası$",
-                        r"^privacy policy$",
-                        r"^terms(?: and conditions)?$",
-                        r"^cookies?$",
-                        r"^iletişim(?: bilgilerimiz)?$",
-                        r"^contact$",
-                        r"^(tel:|telefon:|phone:|mailto:|e-?posta:)",
-                        r"(mah\.|mahalle|sokak|cad\.|no:|pk:|kat\b|daire\b|istanbul|ankara|izmir)",
-                        r"^copyright|^©",
-                    ]
-                ),
-                flags=re.I,
-            )
-            lines = [l for l in lines if l and not footer_or_noise.search(l) and len(l) > 2]
-        else:
-            lines = [l for l in lines if l]
-
-        # case-insensitive dedup
-        seen = set()
-        deduped = []
-        for l in lines:
-            key = l.lower()
-            if key not in seen:
-                seen.add(key)
-                deduped.append(l)
-
-        result = "\n".join(deduped)
-        result = re.sub(r"\n{3,}", "\n\n", result).strip()
-        return result
+    def clean_markdown(md: str) -> str:
+        """Basit markdown temizleyici"""
+        out = md.replace("\r\n", "\n").replace("\r", "\n")
+        out = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", out)  # görselleri sil
+        out = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", out)  # linkleri text'e çevir
+        out = re.sub(r"https?://\S+", "", out)  # çıplak URL sil
+        return out.strip()
 
     @staticmethod
-    def chunk_text(text: str, target: int = 1100, overlap: int = 180) -> List[Tuple[str, int, int, List[str]]]:
-        """Başlık+paragraf odaklı chunking."""
-        parts = re.split(r"(?m)^(#{1,6}\s.+)$", text)
-        blocks = []
-        for i in range(0, len(parts), 2):
-            pre = parts[i]
-            hdr = parts[i + 1] if i + 1 < len(parts) else None
-            body = parts[i + 2] if i + 2 < len(parts) else ""
-            if hdr:
-                blocks.append((hdr.strip(), body))
-            elif pre.strip():
-                blocks.append(("# Loose", pre))
-
+    def _chunk_text_simple(text: str, size: int = 1500, overlap: int = 200) -> List[str]:
+        """Uzun text'i sabit uzunlukta parçalara böler."""
         chunks = []
-        cursor = 0
-        for hdr, body in blocks:
-            h_path = [hdr.lstrip("# ").strip()]
-            paras = [p.strip() for p in body.split("\n\n") if p.strip()]
-            buf = hdr + "\n"
-            start = cursor
-            for p in paras:
-                if len(buf) + len(p) + 2 <= target:
-                    buf += "\n" + p
-                else:
-                    end = start + len(buf)
-                    chunks.append((buf.strip(), start, end, h_path))
-                    tail = buf[-overlap:] if overlap > 0 else ""
-                    buf = (hdr + "\n" + tail + p)[-target:]
-                    start = end - len(buf)
-            if buf.strip():
-                end = start + len(buf)
-                chunks.append((buf.strip(), start, end, h_path))
-                cursor = end
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + size, n)
+            chunks.append(text[start:end])
+            start += size - overlap
         return chunks
 
-    # ---------- Internal helpers ----------
+    # =====================================================
+    # 🔐 İÇ YARDIMCILAR
+    # =====================================================
 
     @staticmethod
     def _normalize(a: np.ndarray) -> np.ndarray:
@@ -377,7 +271,7 @@ class EmbeddingIndex:
 
     def _save_state(self) -> None:
         with open(self.meta_path, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self.meta.items()}, f, ensure_ascii=False)
+            json.dump({str(k): v for k, v in self.meta.items()}, f, ensure_ascii=False, indent=2)
         if self.index is not None:
             faiss.write_index(self.index, self.index_path)
 
@@ -397,10 +291,9 @@ class EmbeddingIndex:
 
     def _ensure_index(self, dim: int) -> None:
         if self.index is None:
-            base = faiss.IndexFlatIP(dim)  # cosine için IP + normalize
+            base = faiss.IndexFlatIP(dim)
             self.index = faiss.IndexIDMap2(base)
         elif self.index.d != dim:
-            # Model boyutu değişmiş → temiz kurulum
             base = faiss.IndexFlatIP(dim)
             self.index = faiss.IndexIDMap2(base)
             self.meta.clear()
@@ -413,8 +306,7 @@ class EmbeddingIndex:
 
     @staticmethod
     def _is_valid_url(url: str) -> bool:
-        url_regex = re.compile(r"^(?:http|https)://(?:\S+)")
-        return bool(url and re.match(url_regex, url))
+        return bool(url and re.match(r"^(?:http|https)://", url))
 
     @staticmethod
     def _passes_filter(item_meta: Dict[str, Any], filt: Dict[str, Any]) -> bool:
