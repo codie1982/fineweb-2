@@ -82,7 +82,9 @@ class EmbeddingIndex:
             return {"doc_ref": doc_id, "status": "exists"}
 
         # ✂️ Chunk'lara böl
+        t_chunk0 = time.time()
         chunks = self._chunk_text_simple(text, size=chunk_size, overlap=overlap)
+        t_chunk1 = time.time()
         if not chunks:
             raise ValueError("No chunks created from text.")
 
@@ -95,42 +97,58 @@ class EmbeddingIndex:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        # 🔢 Chunk vektörlerini üret
+         # 🔢 Encode
+        t_enc0 = time.time()
         chunk_texts = [c[0] for c in chunks]
         vecs = self.model.encode(chunk_texts)
         vecs = np.array(vecs, dtype=np.float32)
         if vecs.ndim == 1:
             vecs = vecs.reshape(1, -1)
+        t_enc1 = time.time()
 
         dim = vecs.shape[1]
         with self._lock:
             self._ensure_index(dim)
             self._normalize(vecs)
 
+            # ➕ FAISS add
+            t_add0 = time.time()
             start_id = self._next_int_id
             ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
             self._next_int_id += vecs.shape[0]
             self.index.add_with_ids(vecs, ids)
 
-            # 🔗 Her chunk'ı FAISS meta'ya ekle
             for i, (txt, s, e, h_path) in enumerate(chunks):
                 faiss_id = int(ids[i])
                 chunk_id = str(uuid.uuid4())
                 self.meta[faiss_id] = {
                     "external_id": chunk_id,
-                    "text": txt,
+                    # "text": txt,  # İSTERSEN kapalı tut (aşağıdaki bayrakla kontrol edebilirsin)
                     "metadata": {
                         "doc_ref": doc_id,
                         "chunk_index": i,
                         "total_chunks": len(chunks),
                         "sha1": self._sha1_of(txt),
                         "h_path": h_path,
+                        "char_start": s,
+                        "char_end": e,
                     },
                 }
+            t_add1 = time.time()
 
             self._save_state()
 
-        return {"doc_ref": doc_id, "total_chunks": len(chunks), "faiss_ids": ids.tolist()}
+        return {
+            "doc_ref": doc_id,
+            "total_chunks": len(chunks),
+            "faiss_ids": ids.tolist(),
+            "timings": {
+                "chunk_ms": (t_chunk1 - t_chunk0) * 1000.0,
+                "encode_ms": (t_enc1 - t_enc0) * 1000.0,
+                "add_ms": (t_add1 - t_add0) * 1000.0,
+                "total_ms": (t_add1 - t_chunk0) * 1000.0,
+            },
+        }
 
 
 

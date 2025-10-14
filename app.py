@@ -50,6 +50,25 @@ LOG_FILE         = None
 WRITER_POISON    = "__WRITER_POISON__"
 # =====================================
 
+def _stamp() -> str:
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def log(msg: str, tag="SYS", color=Fore.CYAN):
+    line = f"[{_stamp()}] [{tag}] {msg}"
+    # anında ekrana yaz (buffer olmasın)
+    if COLOR: print(f"{color}{line}{Style.RESET_ALL}", flush=True)
+    else: print(line, flush=True)
+    if LOG_FILE:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ["B","KB","MB","GB","TB","PB"]:
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}EB"
 
 def processed_file_path() -> str:
     return os.path.abspath(PROCESSED_FILE)
@@ -127,6 +146,7 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
     log(f"Reader başladı: {len(files)} dosya (atlanan={len(seen_files)}, işlenecek={len(todo)}).", "READER", Fore.BLUE)
 
     for path in todo:
+        log(f"[FILE] reading: {path}", "READER", Fore.BLUE)
         if stop_event.is_set() or sent >= total_limit:
             break
         try:
@@ -190,17 +210,50 @@ def worker(in_q, out_q, stop_event, wid: int):
 
 
 # -------------- WRITER --------------
+# -------------- WRITER --------------
 def writer(in_q: Queue, stop_event: Event):
     try:
         store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
-        seen_sha1 = { (v.get("metadata") or {}).get("full_text_sha1") for v in store.meta.values() if (v.get("metadata") or {}).get("full_text_sha1") }
+
+        # documents kovasından mevcut doküman SHA1'larını çıkar
+        docs_bucket = (store.meta.get("documents") or {})
+        seen_doc_sha1 = {
+            d.get("full_text_sha1")
+            for d in docs_bucket.values()
+            if isinstance(d, dict) and d.get("full_text_sha1")
+        }
+
         finished = 0
-        total_added = 0
+        docs_processed = 0
+        total_chunks_added = 0
         t0 = time.time()
+        last_hb = t0
+        last_rate_n = 0
+        HB_EVERY_S = 30
+        RATE_EVERY = 5000
 
         log("Writer başladı (chunk destekli).", "WRITER", Fore.GREEN)
 
         while True:
+            # Heartbeat
+            now = time.time()
+            if now - last_hb >= HB_EVERY_S:
+                ntotal = store.index.ntotal if store.index else 0
+                meta_size = os.path.getsize(store.meta_path) if os.path.exists(store.meta_path) else 0
+                idx_size  = os.path.getsize(store.index_path) if os.path.exists(store.index_path) else 0
+                log(f"[HB] docs={docs_processed} chunks={total_chunks_added} "
+                    f"ntotal={ntotal} meta={_fmt_bytes(meta_size)} index={_fmt_bytes(idx_size)}",
+                    "WRITER", Fore.CYAN)
+                last_hb = now
+
+            # Rate
+            if total_chunks_added - last_rate_n >= RATE_EVERY:
+                dt = max(now - t0, 1e-6)
+                rps = total_chunks_added / dt
+                log(f"[RATE] chunks={total_chunks_added} | {rps:.1f} chunks/s", "WRITER", Fore.CYAN)
+                last_rate_n = total_chunks_added
+
+            # Çıkış koşulu
             if finished >= N_WORKERS:
                 break
 
@@ -216,35 +269,57 @@ def writer(in_q: Queue, stop_event: Event):
                 finished += 1
                 continue
 
+            # item: (None, [texts], [urls]) şeklinde geliyor (worker sadece iletir)
             _, texts, urls = item
 
             for i, txt in enumerate(texts):
-                if not txt.strip():
+                if not txt or not txt.strip():
                     continue
 
                 full_hash = text_sha1(txt)
-                if full_hash in seen_sha1:
+                if full_hash in seen_doc_sha1:
+                    # aynı doküman (full_text) zaten eklenmiş
                     continue
 
-                metadata = {
-                    "doc_type": DOC_TYPE,
-                    "url": urls[i],
-                    "full_text_sha1": full_hash,
-                    "full_text": txt
-                }
+                url_i = urls[i] if urls and len(urls) > i else None
 
-                results = store.upsert_vector(
+                # upsert_vector içindeki mikrometreler
+                t_doc0 = time.time()
+                res = store.upsert_vector(
                     text=txt,
-                    metadata=metadata,
+                    metadata={"url": url_i, "doc_type": DOC_TYPE},
                     chunk_size=1500,
                     overlap=200
                 )
+                t_doc1 = time.time()
 
-                seen_sha1.add(full_hash)
-                total_added += len(results)
+                docs_processed += 1
+                nchunks = int(res.get("total_chunks", 0))
+                total_chunks_added += nchunks
+                tim = res.get("timings", {})  # varsa kullan, yoksa kendi toplamını yaz
 
+                log(
+                    f"[DOC] #{docs_processed} url={url_i} "
+                    f"doc_ref={res.get('doc_ref')} chunks={nchunks} "
+                    f"chunk={tim.get('chunk_ms',0):.0f}ms enc={tim.get('encode_ms',0):.0f}ms "
+                    f"add={tim.get('add_ms',0):.0f}ms total={tim.get('total_ms', (t_doc1-t_doc0)*1000):.0f}ms",
+                    "WRITER", Fore.GREEN
+                )
+
+                seen_doc_sha1.add(full_hash)
+
+        # Son checkpoint + özet
         flush_atomic(store)
-        log(f"✅ Writer tamamlandı. Toplam {total_added} chunk eklendi | Süre: {time.time()-t0:.1f}s", "WRITER", Fore.GREEN)
+        dt = time.time() - t0
+        rps = total_chunks_added / max(dt, 1e-6)
+        meta_size = os.path.getsize(store.meta_path) if os.path.exists(store.meta_path) else 0
+        idx_size  = os.path.getsize(store.index_path) if os.path.exists(store.index_path) else 0
+        ntotal = store.index.ntotal if store.index else 0
+
+        log(f"✅ Writer tamamlandı. docs={docs_processed} chunks={total_chunks_added} "
+            f"| {dt:.1f}s, ~{rps:.1f} chunks/s | ntotal={ntotal} "
+            f"| meta={_fmt_bytes(meta_size)} index={_fmt_bytes(idx_size)}",
+            "WRITER", Fore.GREEN)
 
     except Exception as e:
         log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
