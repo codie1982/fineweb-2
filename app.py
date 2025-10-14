@@ -13,8 +13,7 @@ import faiss
 import torch
 from sentence_transformers import SentenceTransformer
 
-# --- colorama (opsiyonel, yoksa sade çıktı) ---
-
+# --- colorama (opsiyonel) ---
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
@@ -29,43 +28,43 @@ except Exception:
 from embedding_index import EmbeddingIndex
 
 # ============== AYARLAR ==============
-ROOT_DIR         = "./fineweb-2/data/tur_Latn/train"    # klasörü istediğin gibi ayarla
+ROOT_DIR         = "./fineweb-2/data/tur_Latn/train"
 INDEX_PATH       = "faiss.index"
 META_PATH        = "meta.json"
 MODEL_NAME       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 N_WORKERS        = 12
-LIMIT_TOTAL      = 100          # tamamını işle (kısa test için 100 gibi ver)
+LIMIT_TOTAL      = 100
 BATCH_READ       = 4096
 BATCH_ENCODE     = 24
 MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
-MAX_TEXT_CHARS   = 1500          # HIZ için metni kırp (None yaparsan kırpmaz)
+MAX_TEXT_CHARS   = 1500
 MAX_SEG_LENGTH   = 128
 TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
 URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 
-Q_R2W_SIZE       = 2000          # büyük kuyruklar → daha akıcı pipeline
+Q_R2W_SIZE       = 2000
 Q_W2WR_SIZE      = 2000
 
-FLUSH_EVERY      = 2000          # writer checkpoint (vektör)
-FLUSH_INTERVAL_S = 30            # writer checkpoint (saniye)
+FLUSH_EVERY      = 2000
+FLUSH_INTERVAL_S = 30
 
-PROCESSED_FILE   = "processed_files.txt"  # dosya-bazlı resume için
-LOG_FILE         = None           # "logs/ingest.log" yazarsan dosyaya da loglar
+PROCESSED_FILE   = "processed_files.txt"
+LOG_FILE         = None
+WRITER_POISON    = "__WRITER_POISON__"   # 🔥 tek seferlik writer kapatma sinyali
 # =====================================
 
+
 def processed_file_path() -> str:
-    # ► mutlak yol (görebilmen için loga basacağız)
     return os.path.abspath(PROCESSED_FILE)
 
 def ensure_processed_file_exists():
     path = processed_file_path()
     if not os.path.exists(path):
-        # dosya yarat (atomic değil ama tek yazar 'reader' olduğu için yeterli)
         with open(path, "w", encoding="utf-8") as f:
-            f.write("")  # boş oluştur
+            f.write("")
     return path
 
 def load_processed() -> Set[str]:
@@ -78,7 +77,6 @@ def load_processed() -> Set[str]:
         return set()
 
 def mark_processed(path: str):
-    # ► hemen diske (flush + fsync)
     pf = processed_file_path()
     try:
         with open(pf, "a", encoding="utf-8") as f:
@@ -87,6 +85,7 @@ def mark_processed(path: str):
             os.fsync(f.fileno())
     except Exception as e:
         log(f"⚠️ processed_files yazılamadı: {e}", "READER", Fore.YELLOW)
+
 
 # -------------- LOG --------------
 def _stamp() -> str:
@@ -115,7 +114,6 @@ def text_sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 def flush_atomic(store: EmbeddingIndex):
-    """faiss.index ve meta.json'u temp dosyaya yazıp atomik rename ile değiştir."""
     meta_tmp = store.meta_path + ".tmp"
     with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump({str(k): v for k, v in store.meta.items()}, f, ensure_ascii=False)
@@ -125,33 +123,26 @@ def flush_atomic(store: EmbeddingIndex):
     faiss.write_index(store.index, idx_tmp)
     os.replace(idx_tmp, store.index_path)
 
-# ----- Global model (fork paylaşımı) -----
+
+# ----- Global model -----
 MODEL: Optional[SentenceTransformer] = None
 def preload_model():
     global MODEL
     if MODEL is None:
-        log("Model yükleniyor… (tek sefer)", "SYS", Fore.CYAN)
+        log("Model yükleniyor…", "SYS", Fore.CYAN)
         MODEL = SentenceTransformer(MODEL_NAME)
         MODEL.max_seq_length = MAX_SEG_LENGTH
         MODEL.eval()
         log("Model hazır.", "SYS", Fore.CYAN)
 
-# ----- processed_files resume -----
 
-
-
-
-# -------------- PROCESSES --------------
+# -------------- READER --------------
 def reader(files: List[str], out_q: Queue, stop_event: Event):
-    """
-    Parquet dosyalarını tarayıp (text,url) örneklerini kuyruğa gönderir.
-    processed_files.txt’de olanları atlar (resume).
-    """
     sent = 0
     total_limit = LIMIT_TOTAL if isinstance(LIMIT_TOTAL, int) else float("inf")
     seen_files = load_processed()
     todo = [p for p in files if p not in seen_files]
-    log(f"Reader başladı: {len(files)} dosya (atlanan={len(seen_files)}, işlenecek={len(todo)}). Limit={total_limit if total_limit!=float('inf') else 'ALL'}", "READER", Fore.BLUE)
+    log(f"Reader başladı: {len(files)} dosya (atlanan={len(seen_files)}, işlenecek={len(todo)}).", "READER", Fore.BLUE)
 
     for path in todo:
         if stop_event.is_set() or sent >= total_limit:
@@ -160,7 +151,6 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
             ds_ = ds.dataset(path, format="parquet")
         except Exception as e:
             log(f"❌ okunamadı: {path} -> {e}", "READER", Fore.RED)
-            # bozuksa yine processed olarak işaretleyelim ki takılmasın (istersen etme)
             mark_processed(path)
             continue
 
@@ -168,11 +158,11 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
         tcol  = pick_col(names, TEXT_CANDS)
         ucol  = pick_col(names, URL_CANDS)
         if not tcol:
-            log(f"⚠️ metin kolonu yok, atla: {path} -> {names}", "READER", Fore.YELLOW)
+            log(f"⚠️ metin kolonu yok, atla: {path}", "READER", Fore.YELLOW)
             mark_processed(path)
             continue
 
-        scanner = ds_.scanner(columns=[tcol] + ([ucol] if ucol else []), batch_size=BATCH_READ,use_threads=True)
+        scanner = ds_.scanner(columns=[tcol] + ([ucol] if ucol else []), batch_size=BATCH_READ, use_threads=True)
         for b in scanner.to_batches():
             if stop_event.is_set(): break
             d = b.to_pydict()
@@ -186,188 +176,114 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
                     s = s[:MAX_TEXT_CHARS]
                 if not (MIN_CHARS <= len(s) <= MAX_CHARS): continue
                 u = urls[i] if urls and urls[i] else f"http://fw2.local/{os.path.basename(path)}-{i}"
-                out_q.put((s, u))  # backpressure normal
+                out_q.put((s, u))
                 sent += 1
-                if sent % 5000 == 0:
-                    log(f"[READER] queued={sent}", "READER", Fore.BLUE)
-            if sent >= total_limit: break
-
-        # bu dosya bitti — processed olarak işaretle
         mark_processed(path)
 
-    # worker'lara bitiş sinyali
     for _ in range(N_WORKERS):
         out_q.put(None)
-    log(f"✅ Reader bitti. Kuyruğa {min(sent, total_limit)} örnek gönderildi.", "READER", Fore.BLUE)
+    log(f"✅ Reader bitti. Kuyruğa {sent} örnek gönderildi.", "READER", Fore.BLUE)
 
 
+# -------------- WORKER --------------
 def worker(in_q, out_q, stop_event, wid: int):
-    import gc, time
     torch.set_num_threads(1)
     faiss.omp_set_num_threads(1)
-
     global MODEL
     if MODEL is None:
         MODEL = SentenceTransformer(MODEL_NAME)
         MODEL.eval()
 
     log(f"Worker-{wid} başladı.", f"W{wid}", Fore.MAGENTA)
-
     processed = 0
     batch_texts, batch_urls = [], []
     last_push_t = time.time()
-    PARTIAL_FLUSH_S = 10      # 🔸 batch 24’e ulaşmasa bile 10 sn dolunca gönder
+    PARTIAL_FLUSH_S = 10
 
     while True:
         if stop_event.is_set():
-            # elde kalan varsa gönder
             if batch_texts:
-                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
+                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE, show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
-                processed += len(batch_texts)
-                del vecs; gc.collect()
             out_q.put(None)
             break
 
         try:
             item = in_q.get(timeout=2)
         except queue.Empty:
-            # 🔸 zaman bazlı kısmi flush
             if batch_texts and (time.time() - last_push_t) >= PARTIAL_FLUSH_S:
-                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
+                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE, show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
-                processed += len(batch_texts)
                 batch_texts, batch_urls = [], []
-                del vecs; gc.collect()
-                last_push_t = time.time()
             continue
 
         if item is None:
-            # reader bitti → elde kalan varsa gönder ve çık
             if batch_texts:
-                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
+                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE, show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
-                processed += len(batch_texts)
-                del vecs; gc.collect()
             out_q.put(None)
             break
 
         text, url = item
         batch_texts.append(text)
         batch_urls.append(url)
-
-        # 🔸 geleni sayıp ara ara logla (tüketim var mı görelim)
-        if processed % 1000 == 0 and processed > 0:
-            log(f"Worker-{wid} tüketim ilerleme: {processed}", f"W{wid}", Fore.MAGENTA)
-
-        # 🔸 batch dolduysa gönder
         if len(batch_texts) >= BATCH_ENCODE:
-            vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
-                                show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
+            vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE, show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
             out_q.put((vecs, batch_texts, batch_urls))
-            processed += len(batch_texts)
             batch_texts, batch_urls = [], []
-            del vecs; gc.collect()
             last_push_t = time.time()
 
     log(f"Worker-{wid} tamamlandı. İşlenen: {processed}", f"W{wid}", Fore.MAGENTA)
 
 
-
+# -------------- WRITER --------------
 def writer(in_q: Queue, stop_event: Event):
-    """Writer: FAISS + meta'ya toplu ekler, periyodik atomik checkpoint + dup guard + heartbeat."""
     try:
         store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
-
-        seen_sha1 = set()
-        for v in store.meta.values():
-            h = (v.get("metadata") or {}).get("sha1")
-            if h: seen_sha1.add(h)
-
+        seen_sha1 = { (v.get("metadata") or {}).get("sha1") for v in store.meta.values() if (v.get("metadata") or {}).get("sha1") }
         finished = 0
         total_added = 0
         t0 = time.time()
-        last_flush_n = 0
-        last_flush_t = time.time()
-
-        received_total = 0
-        skipped_total  = 0
-        kept_total     = 0
-        last_hb_t      = time.time()
 
         log("Writer başladı.", "WRITER", Fore.GREEN)
 
-        def heartbeat():
-            nonlocal last_hb_t
-            now = time.time()
-            if now - last_hb_t >= 60:
-                log(f"[HB] recv={received_total} kept={kept_total} skipped={skipped_total} ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
-                last_hb_t = now
-
-        def maybe_flush():
-            nonlocal last_flush_n, last_flush_t
-            now = time.time()
-            if (total_added - last_flush_n) >= FLUSH_EVERY or (now - last_flush_t) >= FLUSH_INTERVAL_S:
-                try:
-                    flush_atomic(store)
-                    last_flush_n = total_added
-                    last_flush_t = now
-                    log(f"💾 Checkpoint: ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
-                except Exception as e:
-                    log(f"⚠️ Flush hatası: {e}", "WRITER", Fore.YELLOW)
-
         while True:
-            # ÇIKIŞ KOŞULU: tüm worker'lardan 'None' alındıysa bitir
             if finished >= N_WORKERS:
                 break
 
             try:
                 item = in_q.get(timeout=5)
             except queue.Empty:
-                heartbeat()
-                maybe_flush()
-                # finished sayısı artmışsa bir sonraki turda break olacak
                 continue
+
+            # 🔥 Parent’tan gelen kapatma sinyali
+            if item == WRITER_POISON:
+                break
 
             if item is None:
                 finished += 1
-                # burada doğrudan continue; üstteki başta kontrol kıracak
                 continue
 
             vecs, texts, urls = item
-            vecs = np.asarray(vecs)
-            if vecs.dtype == np.float16:
-                vecs = vecs.astype(np.float32)
-
-            received_total += len(texts)
-
-            keep_idx = []
-            sha1_list = []
-            local_skipped = 0
-            for i, txt in enumerate(texts):
-                h = text_sha1(txt)
-                if h in seen_sha1:
-                    local_skipped += 1
-                    continue
-                keep_idx.append(i)
-                sha1_list.append(h)
-            skipped_total += local_skipped
-
-            if not keep_idx:
-                heartbeat()
-                maybe_flush()
-                continue
-
             vecs = np.asarray(vecs, dtype=np.float32)
             if vecs.ndim == 1:
                 vecs = vecs.reshape(1, -1)
+
+            keep_idx = []
+            sha1_list = []
+            for i, txt in enumerate(texts):
+                h = text_sha1(txt)
+                if h in seen_sha1:
+                    continue
+                keep_idx.append(i)
+                sha1_list.append(h)
+
+            if not keep_idx:
+                continue
+
             vecs = vecs[keep_idx, :]
             texts = [texts[i] for i in keep_idx]
-            urls  = [urls[i]  for i in keep_idx]
-            kept_total += len(texts)
+            urls  = [urls[i] for i in keep_idx]
 
             dim = vecs.shape[1]
             with store._lock:
@@ -376,38 +292,22 @@ def writer(in_q: Queue, stop_event: Event):
                 ids = np.arange(start, start + len(texts), dtype=np.int64)
                 store._next_int_id += len(texts)
                 store.index.add_with_ids(vecs, ids)
-
                 for j, fid in enumerate(ids):
                     store.meta[int(fid)] = {
                         "external_id": os.urandom(8).hex(),
                         "text": texts[j],
-                        "metadata": {
-                            "doc_type": DOC_TYPE,
-                            "url": urls[j],
-                            "h_path": ["# Loose"],
-                            "sha1": sha1_list[j],
-                        },
+                        "metadata": {"doc_type": DOC_TYPE, "url": urls[j], "sha1": sha1_list[j]},
                     }
                     seen_sha1.add(sha1_list[j])
 
             total_added += len(texts)
-            if total_added % 5000 == 0 and total_added > 0:
-                dt = time.time() - t0
-                rps = total_added / max(dt, 1e-6)
-                log(f"[RATE] added={total_added} | {rps:.1f} vec/s", "WRITER", Fore.GREEN)
 
-            heartbeat()
-            maybe_flush()
-
-        # son flush (atomik)
-        try:
-            flush_atomic(store)
-        except Exception as e:
-            log(f"⚠️ Final flush hatası: {e}", "WRITER", Fore.YELLOW)
-
+        flush_atomic(store)
         log(f"✅ Writer tamamlandı. Toplam {total_added} vektör | {time.time()-t0:.1f}s", "WRITER", Fore.GREEN)
+
     except Exception as e:
         log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
+
 
 # -------------- MAIN --------------
 def main():
@@ -419,7 +319,6 @@ def main():
     pf = ensure_processed_file_exists()
     log(f"Resume dosyası: {pf}", "SYS", Fore.CYAN)
 
-    # Thread sınırları (CPU thrash'i önlemek için)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
@@ -432,33 +331,24 @@ def main():
         log(f"❌ Parquet bulunamadı: {ROOT_DIR}", "SYS", Fore.RED)
         sys.exit(1)
 
-    info_limit = LIMIT_TOTAL if LIMIT_TOTAL is not None else "ALL"
-    log(f"{len(files)} dosya | workers={N_WORKERS} | limit={info_limit}", "SYS", Fore.CYAN)
-
     stop_event = Event()
+    q_r2w  = Queue(maxsize=Q_R2W_SIZE)
+    q_w2wr = Queue(maxsize=Q_W2WR_SIZE)
 
-    q_r2w  = Queue(maxsize=Q_R2W_SIZE)   # reader -> workers
-    q_w2wr = Queue(maxsize=Q_W2WR_SIZE)  # workers -> writer
-
-    # writer'ı daemon=False tut ki checkpoint'i güvenle yazabilsin
     p_reader = Process(target=reader, args=(files, q_r2w, stop_event), daemon=True)
     p_writer = Process(target=writer, args=(q_w2wr, stop_event), daemon=False)
-    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True)
-                for i in range(N_WORKERS)]
+    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True) for i in range(N_WORKERS)]
 
     def graceful_shutdown(signum=None, frame=None):
         log(f"⚠️ Sinyal alındı ({signum}). Kapanış başlatılıyor…", "SYS", Fore.YELLOW)
         stop_event.set()
-        # Reader/worker hattını kapat
         try:
             for _ in range(N_WORKERS):
                 q_r2w.put_nowait(None)
         except Exception:
             pass
-        # Writer'ı da garanti kapat (workers düşmüş olsa bile)
         try:
-            for _ in range(N_WORKERS):
-                q_w2wr.put_nowait(None)
+            q_w2wr.put_nowait(WRITER_POISON)
         except Exception:
             pass
 
@@ -468,44 +358,31 @@ def main():
 
     t0 = time.time()
     p_writer.start()
-    for p in workers:
-        p.start()
+    for p in workers: p.start()
     p_reader.start()
 
     try:
-        # 1) Reader tamamen bitsin
         p_reader.join()
-        # 2) Bütün worker'lar bitsin
-        for p in workers:
-            p.join()
+        for p in workers: p.join()
 
-        # 3) GARANTİ: writer'ın alması gereken None sayısını biz de gönderelim
-        # (Her worker zaten None yolluyor ama düşen olursa writer beklemesin)
-        for _ in range(N_WORKERS):
-            try:
-                q_w2wr.put_nowait(None)
-            except Exception:
-                pass
+        # ✅ writer’a tek seferlik poison pill gönder
+        try:
+            q_w2wr.put_nowait(WRITER_POISON)
+        except Exception:
+            pass
 
-        # 4) Writer bitsin (checkpoint flush burada olur)
         p_writer.join()
 
     except KeyboardInterrupt:
         graceful_shutdown(signal.SIGINT, None)
-
-        # Worker'ları kapat
         for p in workers:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
-
-        # Writer'a garanti kapanış sinyali
-        for _ in range(N_WORKERS):
-            try:
-                q_w2wr.put_nowait(None)
-            except Exception:
-                pass
-
+        try:
+            q_w2wr.put_nowait(WRITER_POISON)
+        except Exception:
+            pass
         p_writer.join(timeout=10)
         if p_writer.is_alive():
             p_writer.terminate()
@@ -513,6 +390,7 @@ def main():
     finally:
         log(f"🏁 Toplam süre: {time.time()-t0:.1f}s", "SYS", Fore.CYAN)
         log(f"FAISS: {INDEX_PATH} | META: {META_PATH}", "SYS", Fore.CYAN)
+
 
 if __name__ == "__main__":
     main()
