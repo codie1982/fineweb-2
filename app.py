@@ -35,26 +35,58 @@ META_PATH        = "meta.json"
 MODEL_NAME       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 N_WORKERS        = 12
-LIMIT_TOTAL      = None          # tamamını işle (kısa test için 100 gibi ver)
-BATCH_READ       = 16384
-BATCH_ENCODE     = 96
+LIMIT_TOTAL      = 100          # tamamını işle (kısa test için 100 gibi ver)
+BATCH_READ       = 4096
+BATCH_ENCODE     = 24
 MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
-MAX_TEXT_CHARS   = 3000          # HIZ için metni kırp (None yaparsan kırpmaz)
-MAX_SEG_LENGTH   = 256
+MAX_TEXT_CHARS   = 1500          # HIZ için metni kırp (None yaparsan kırpmaz)
+MAX_SEG_LENGTH   = 128
 TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
 URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 
-Q_R2W_SIZE       = 15000          # büyük kuyruklar → daha akıcı pipeline
-Q_W2WR_SIZE      = 15000
+Q_R2W_SIZE       = 2000          # büyük kuyruklar → daha akıcı pipeline
+Q_W2WR_SIZE      = 2000
 
-FLUSH_EVERY      = 5000          # writer checkpoint (vektör)
-FLUSH_INTERVAL_S = 60            # writer checkpoint (saniye)
+FLUSH_EVERY      = 2000          # writer checkpoint (vektör)
+FLUSH_INTERVAL_S = 30            # writer checkpoint (saniye)
 
 PROCESSED_FILE   = "processed_files.txt"  # dosya-bazlı resume için
 LOG_FILE         = None           # "logs/ingest.log" yazarsan dosyaya da loglar
 # =====================================
+
+def processed_file_path() -> str:
+    # ► mutlak yol (görebilmen için loga basacağız)
+    return os.path.abspath(PROCESSED_FILE)
+
+def ensure_processed_file_exists():
+    path = processed_file_path()
+    if not os.path.exists(path):
+        # dosya yarat (atomic değil ama tek yazar 'reader' olduğu için yeterli)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")  # boş oluştur
+    return path
+
+def load_processed() -> Set[str]:
+    path = ensure_processed_file_exists()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(l.strip() for l in f if l.strip())
+    except Exception as e:
+        log(f"⚠️ processed_files okunamadı: {e}", "SYS", Fore.YELLOW)
+        return set()
+
+def mark_processed(path: str):
+    # ► hemen diske (flush + fsync)
+    pf = processed_file_path()
+    try:
+        with open(pf, "a", encoding="utf-8") as f:
+            f.write(path + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        log(f"⚠️ processed_files yazılamadı: {e}", "READER", Fore.YELLOW)
 
 # -------------- LOG --------------
 def _stamp() -> str:
@@ -105,15 +137,9 @@ def preload_model():
         log("Model hazır.", "SYS", Fore.CYAN)
 
 # ----- processed_files resume -----
-def load_processed() -> Set[str]:
-    if not os.path.exists(PROCESSED_FILE):
-        return set()
-    with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
-        return set(l.strip() for l in f if l.strip())
 
-def mark_processed(path: str):
-    with open(PROCESSED_FILE, "a", encoding="utf-8") as f:
-        f.write(path + "\n")
+
+
 
 # -------------- PROCESSES --------------
 def reader(files: List[str], out_q: Queue, stop_event: Event):
@@ -162,6 +188,8 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
                 u = urls[i] if urls and urls[i] else f"http://fw2.local/{os.path.basename(path)}-{i}"
                 out_q.put((s, u))  # backpressure normal
                 sent += 1
+                if sent % 5000 == 0:
+                    log(f"[READER] queued={sent}", "READER", Fore.BLUE)
             if sent >= total_limit: break
 
         # bu dosya bitti — processed olarak işaretle
@@ -173,8 +201,8 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
     log(f"✅ Reader bitti. Kuyruğa {min(sent, total_limit)} örnek gönderildi.", "READER", Fore.BLUE)
 
 
-def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
-    """Worker: gelen metinleri batch halinde encode eder ve writer'a yollar."""
+def worker(in_q, out_q, stop_event, wid: int):
+    import gc, time
     torch.set_num_threads(1)
     faiss.omp_set_num_threads(1)
 
@@ -184,27 +212,40 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         MODEL.eval()
 
     log(f"Worker-{wid} başladı.", f"W{wid}", Fore.MAGENTA)
-    processed, t0 = 0, time.time()
+
+    processed = 0
     batch_texts, batch_urls = [], []
+    last_push_t = time.time()
+    PARTIAL_FLUSH_S = 10      # 🔸 batch 24’e ulaşmasa bile 10 sn dolunca gönder
 
     while True:
         if stop_event.is_set():
+            # elde kalan varsa gönder
             if batch_texts:
                 vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
                                     show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
                 out_q.put((vecs, batch_texts, batch_urls))
                 processed += len(batch_texts)
-                # bellek temizliği
                 del vecs; gc.collect()
             out_q.put(None)
             break
 
         try:
-            item = in_q.get(timeout=5)
+            item = in_q.get(timeout=2)
         except queue.Empty:
+            # 🔸 zaman bazlı kısmi flush
+            if batch_texts and (time.time() - last_push_t) >= PARTIAL_FLUSH_S:
+                vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
+                                    show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
+                out_q.put((vecs, batch_texts, batch_urls))
+                processed += len(batch_texts)
+                batch_texts, batch_urls = [], []
+                del vecs; gc.collect()
+                last_push_t = time.time()
             continue
 
         if item is None:
+            # reader bitti → elde kalan varsa gönder ve çık
             if batch_texts:
                 vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
                                     show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
@@ -218,150 +259,165 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         batch_texts.append(text)
         batch_urls.append(url)
 
+        # 🔸 geleni sayıp ara ara logla (tüketim var mı görelim)
+        if processed % 1000 == 0 and processed > 0:
+            log(f"Worker-{wid} tüketim ilerleme: {processed}", f"W{wid}", Fore.MAGENTA)
+
+        # 🔸 batch dolduysa gönder
         if len(batch_texts) >= BATCH_ENCODE:
             vecs = MODEL.encode(batch_texts, batch_size=BATCH_ENCODE,
                                 show_progress_bar=False, normalize_embeddings=True).astype(np.float16)
             out_q.put((vecs, batch_texts, batch_urls))
             processed += len(batch_texts)
-            # reset & bellek temizliği
             batch_texts, batch_urls = [], []
             del vecs; gc.collect()
+            last_push_t = time.time()
 
-    log(f"Worker-{wid} tamamlandı. İşlenen: {processed} | {time.time()-t0:.1f}s", f"W{wid}", Fore.MAGENTA)
+    log(f"Worker-{wid} tamamlandı. İşlenen: {processed}", f"W{wid}", Fore.MAGENTA)
+
 
 
 def writer(in_q: Queue, stop_event: Event):
     """Writer: FAISS + meta'ya toplu ekler, periyodik atomik checkpoint + dup guard + heartbeat."""
-    store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
-
-    # Dup guard: mevcut meta'dan sha1 set'i oluştur
-    seen_sha1 = set()
-    for v in store.meta.values():
-        h = (v.get("metadata") or {}).get("sha1")
-        if h: seen_sha1.add(h)
-
-    finished = 0
-    total_added = 0
-    t0 = time.time()
-    last_flush_n = 0
-    last_flush_t = time.time()
-
-    # heartbeat istatistikleri
-    received_total = 0
-    skipped_total  = 0
-    kept_total     = 0
-    last_hb_t      = time.time()
-
-    log("Writer başladı.", "WRITER", Fore.GREEN)
-
-    def heartbeat():
-        nonlocal last_hb_t
-        now = time.time()
-        if now - last_hb_t >= 60:  # her 60 saniyede bir
-            log(f"[HB] recv={received_total} kept={kept_total} skipped={skipped_total} ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
-            last_hb_t = now
-
-    def maybe_flush():
-        nonlocal last_flush_n, last_flush_t
-        now = time.time()
-        if (total_added - last_flush_n) >= FLUSH_EVERY or (now - last_flush_t) >= FLUSH_INTERVAL_S:
-            try:
-                flush_atomic(store)
-                last_flush_n = total_added
-                last_flush_t = now
-                log(f"💾 Checkpoint: ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
-            except Exception as e:
-                log(f"⚠️ Flush hatası: {e}", "WRITER", Fore.YELLOW)
-
-    while True:
-        heartbeat()
-        maybe_flush()
-
-        if stop_event.is_set() and finished >= N_WORKERS:
-            break
-
-        try:
-            item = in_q.get(timeout=5)
-        except queue.Empty:
-            if stop_event.is_set() and finished >= N_WORKERS:
-                break
-            continue
-
-        if item is None:
-            finished += 1
-            if stop_event.is_set() and finished >= N_WORKERS:
-                break
-            continue
-
-        vecs, texts, urls = item
-        vecs = np.asarray(vecs)
-        if vecs.dtype == np.float16:
-            vecs = vecs.astype(np.float32)
-
-        
-        received_total += len(texts)
-
-        # DUP GUARD
-        keep_idx = []
-        sha1_list = []
-        local_skipped = 0
-        for i, txt in enumerate(texts):
-            h = text_sha1(txt)
-            if h in seen_sha1:
-                local_skipped += 1
-                continue
-            keep_idx.append(i)
-            sha1_list.append(h)
-        skipped_total += local_skipped
-
-        if not keep_idx:
-            heartbeat()
-            continue
-
-        vecs = np.asarray(vecs, dtype=np.float32)
-        if vecs.ndim == 1: vecs = vecs.reshape(1, -1)
-        vecs = vecs[keep_idx, :]
-        texts = [texts[i] for i in keep_idx]
-        urls  = [urls[i]  for i in keep_idx]
-        kept_total += len(texts)
-
-        dim = vecs.shape[1]
-        with store._lock:
-            store._ensure_index(dim)
-            start = store._next_int_id
-            ids = np.arange(start, start + len(texts), dtype=np.int64)
-            store._next_int_id += len(texts)
-            store.index.add_with_ids(vecs, ids)
-
-            for j, fid in enumerate(ids):
-                store.meta[int(fid)] = {
-                    "external_id": os.urandom(8).hex(),
-                    "text": texts[j],
-                    "metadata": {
-                        "doc_type": DOC_TYPE,
-                        "url": urls[j],
-                        "h_path": ["# Loose"],
-                        "sha1": sha1_list[j],
-                    },
-                }
-                seen_sha1.add(sha1_list[j])
-
-        total_added += len(texts)
-        if total_added % 2000 == 0:
-            log(f"WRITER ilerleme: {total_added} vektör", "WRITER", Fore.GREEN)
-
-    # son flush (atomik)
     try:
-        flush_atomic(store)
-    except Exception as e:
-        log(f"⚠️ Final flush hatası: {e}", "WRITER", Fore.YELLOW)
+        store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
 
-    log(f"✅ Writer tamamlandı. Toplam {total_added} vektör | {time.time()-t0:.1f}s", "WRITER", Fore.GREEN)
+        # Dup guard: mevcut meta'dan sha1 set'i oluştur
+        seen_sha1 = set()
+        for v in store.meta.values():
+            h = (v.get("metadata") or {}).get("sha1")
+            if h: seen_sha1.add(h)
+
+        finished = 0
+        total_added = 0
+        t0 = time.time()
+        last_flush_n = 0
+        last_flush_t = time.time()
+
+        # heartbeat istatistikleri
+        received_total = 0
+        skipped_total  = 0
+        kept_total     = 0
+        last_hb_t      = time.time()
+
+        log("Writer başladı.", "WRITER", Fore.GREEN)
+
+        def heartbeat():
+            nonlocal last_hb_t
+            now = time.time()
+            if now - last_hb_t >= 60:  # her 60 saniyede bir
+                log(f"[HB] recv={received_total} kept={kept_total} skipped={skipped_total} ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
+                last_hb_t = now
+
+        def maybe_flush():
+            nonlocal last_flush_n, last_flush_t
+            now = time.time()
+            if (total_added - last_flush_n) >= FLUSH_EVERY or (now - last_flush_t) >= FLUSH_INTERVAL_S:
+                try:
+                    flush_atomic(store)
+                    last_flush_n = total_added
+                    last_flush_t = now
+                    log(f"💾 Checkpoint: ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
+                except Exception as e:
+                    log(f"⚠️ Flush hatası: {e}", "WRITER", Fore.YELLOW)
+
+        while True:
+            heartbeat()
+            maybe_flush()
+
+            if stop_event.is_set() and finished >= N_WORKERS:
+                break
+
+            try:
+                item = in_q.get(timeout=5)
+            except queue.Empty:
+                if stop_event.is_set() and finished >= N_WORKERS:
+                    break
+                continue
+
+            if item is None:
+                finished += 1
+                if stop_event.is_set() and finished >= N_WORKERS:
+                    break
+                continue
+
+            vecs, texts, urls = item
+            vecs = np.asarray(vecs)
+            if vecs.dtype == np.float16:
+                vecs = vecs.astype(np.float32)
+
+            
+            received_total += len(texts)
+
+            # DUP GUARD
+            keep_idx = []
+            sha1_list = []
+            local_skipped = 0
+            for i, txt in enumerate(texts):
+                h = text_sha1(txt)
+                if h in seen_sha1:
+                    local_skipped += 1
+                    continue
+                keep_idx.append(i)
+                sha1_list.append(h)
+            skipped_total += local_skipped
+
+            if not keep_idx:
+                heartbeat()
+                continue
+
+            vecs = np.asarray(vecs, dtype=np.float32)
+            if vecs.ndim == 1: vecs = vecs.reshape(1, -1)
+            vecs = vecs[keep_idx, :]
+            texts = [texts[i] for i in keep_idx]
+            urls  = [urls[i]  for i in keep_idx]
+            kept_total += len(texts)
+
+            dim = vecs.shape[1]
+            with store._lock:
+                store._ensure_index(dim)
+                start = store._next_int_id
+                ids = np.arange(start, start + len(texts), dtype=np.int64)
+                store._next_int_id += len(texts)
+                store.index.add_with_ids(vecs, ids)
+
+                for j, fid in enumerate(ids):
+                    store.meta[int(fid)] = {
+                        "external_id": os.urandom(8).hex(),
+                        "text": texts[j],
+                        "metadata": {
+                            "doc_type": DOC_TYPE,
+                            "url": urls[j],
+                            "h_path": ["# Loose"],
+                            "sha1": sha1_list[j],
+                        },
+                    }
+                    seen_sha1.add(sha1_list[j])
+
+            total_added += len(texts)
+            if total_added % 5000 == 0 and total_added > 0:
+                dt = time.time() - t0
+                rps = total_added / max(dt, 1e-6)
+                log(f"[RATE] added={total_added} | {rps:.1f} vec/s", "WRITER", Fore.GREEN)
+
+        # son flush (atomik)
+        try:
+            flush_atomic(store)
+        except Exception as e:
+            log(f"⚠️ Final flush hatası: {e}", "WRITER", Fore.YELLOW)
+
+        log(f"✅ Writer tamamlandı. Toplam {total_added} vektör | {time.time()-t0:.1f}s", "WRITER", Fore.GREEN)
+    except Exception as e:
+            log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
 
 # -------------- MAIN --------------
 def main():
     try: set_start_method("fork", force=True)
     except RuntimeError: pass
+
+    # …
+    pf = ensure_processed_file_exists()
+    log(f"Resume dosyası: {pf}", "SYS", Fore.CYAN)
 
     # thread sınırları
     os.environ.setdefault("OMP_NUM_THREADS", "1")
