@@ -411,14 +411,15 @@ def writer(in_q: Queue, stop_event: Event):
 
 # -------------- MAIN --------------
 def main():
-    try: set_start_method("fork", force=True)
-    except RuntimeError: pass
+    try:
+        set_start_method("fork", force=True)
+    except RuntimeError:
+        pass
 
-    # …
     pf = ensure_processed_file_exists()
     log(f"Resume dosyası: {pf}", "SYS", Fore.CYAN)
 
-    # thread sınırları
+    # Thread sınırları (CPU thrash'i önlemek için)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
@@ -428,25 +429,36 @@ def main():
 
     files = list_parquets(ROOT_DIR)
     if not files:
-        log(f"❌ Parquet bulunamadı: {ROOT_DIR}", "SYS", Fore.RED); sys.exit(1)
+        log(f"❌ Parquet bulunamadı: {ROOT_DIR}", "SYS", Fore.RED)
+        sys.exit(1)
+
     info_limit = LIMIT_TOTAL if LIMIT_TOTAL is not None else "ALL"
     log(f"{len(files)} dosya | workers={N_WORKERS} | limit={info_limit}", "SYS", Fore.CYAN)
 
     stop_event = Event()
 
-    q_r2w  = Queue(maxsize=Q_R2W_SIZE)
-    q_w2wr = Queue(maxsize=Q_W2WR_SIZE)
+    q_r2w  = Queue(maxsize=Q_R2W_SIZE)   # reader -> workers
+    q_w2wr = Queue(maxsize=Q_W2WR_SIZE)  # workers -> writer
 
+    # writer'ı daemon=False tut ki checkpoint'i güvenle yazabilsin
     p_reader = Process(target=reader, args=(files, q_r2w, stop_event), daemon=True)
-    p_writer = Process(target=writer, args=(q_w2wr, stop_event), daemon=True)
-    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True) for i in range(N_WORKERS)]
+    p_writer = Process(target=writer, args=(q_w2wr, stop_event), daemon=False)
+    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True)
+                for i in range(N_WORKERS)]
 
     def graceful_shutdown(signum=None, frame=None):
         log(f"⚠️ Sinyal alındı ({signum}). Kapanış başlatılıyor…", "SYS", Fore.YELLOW)
         stop_event.set()
+        # Reader/worker hattını kapat
         try:
             for _ in range(N_WORKERS):
                 q_r2w.put_nowait(None)
+        except Exception:
+            pass
+        # Writer'ı da garanti kapat (workers düşmüş olsa bile)
+        try:
+            for _ in range(N_WORKERS):
+                q_w2wr.put_nowait(None)
         except Exception:
             pass
 
@@ -456,20 +468,48 @@ def main():
 
     t0 = time.time()
     p_writer.start()
-    for p in workers: p.start()
+    for p in workers:
+        p.start()
     p_reader.start()
 
     try:
+        # 1) Reader tamamen bitsin
         p_reader.join()
-        for p in workers: p.join()
+        # 2) Bütün worker'lar bitsin
+        for p in workers:
+            p.join()
+
+        # 3) GARANTİ: writer'ın alması gereken None sayısını biz de gönderelim
+        # (Her worker zaten None yolluyor ama düşen olursa writer beklemesin)
+        for _ in range(N_WORKERS):
+            try:
+                q_w2wr.put_nowait(None)
+            except Exception:
+                pass
+
+        # 4) Writer bitsin (checkpoint flush burada olur)
         p_writer.join()
+
     except KeyboardInterrupt:
         graceful_shutdown(signal.SIGINT, None)
+
+        # Worker'ları kapat
         for p in workers:
             p.join(timeout=5)
-            if p.is_alive(): p.terminate()
+            if p.is_alive():
+                p.terminate()
+
+        # Writer'a garanti kapanış sinyali
+        for _ in range(N_WORKERS):
+            try:
+                q_w2wr.put_nowait(None)
+            except Exception:
+                pass
+
         p_writer.join(timeout=10)
-        if p_writer.is_alive(): p_writer.terminate()
+        if p_writer.is_alive():
+            p_writer.terminate()
+
     finally:
         log(f"🏁 Toplam süre: {time.time()-t0:.1f}s", "SYS", Fore.CYAN)
         log(f"FAISS: {INDEX_PATH} | META: {META_PATH}", "SYS", Fore.CYAN)
