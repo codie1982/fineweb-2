@@ -45,6 +45,10 @@ class EmbeddingIndex:
         except Exception:
             pass
 
+    def _ensure_documents_bucket(self) -> None:
+        # "documents" torbası yoksa oluştur
+        if "documents" not in self.meta or not isinstance(self.meta.get("documents"), dict):
+            self.meta["documents"] = {}
     # =====================================================
     # ✅ GENEL API
     # =====================================================
@@ -265,15 +269,22 @@ class EmbeddingIndex:
         return out.strip()
 
     @staticmethod
-    def _chunk_text_simple(text: str, size: int = 1500, overlap: int = 200) -> List[str]:
-        """Uzun text'i sabit uzunlukta parçalara böler."""
+    def _chunk_text_simple(self,itext: str, size: int = 1500, overlap: int = 200) -> List[str]:
+        """
+        Düz metni sabit boyutlu parçalara böler.
+        Her parça 4-tuple döner: (chunk_text, char_start, char_end, h_path)
+        """
         chunks = []
-        start = 0
         n = len(text)
+        start = 0
         while start < n:
-            end = min(start + size, n)
-            chunks.append(text[start:end])
-            start += size - overlap
+            end = min(n, start + size)
+            chunk_text = text[start:end]
+            # h_path basit default; istersen başlık/paragraf mantığını buraya entegre edebilirsin
+            chunks.append((chunk_text, start, end, ["# Loose"]))
+            # en az 1 karakter ilerle (overlap >= size olursa kilitlenmesin)
+            step = max(1, size - overlap)
+            start += step
         return chunks
 
     # =====================================================
@@ -294,7 +305,14 @@ class EmbeddingIndex:
     def _load_state(self) -> None:
         if os.path.exists(self.meta_path):
             with open(self.meta_path, "r", encoding="utf-8") as f:
-                self.meta = {int(k): v for k, v in json.load(f).items()}
+                raw = json.load(f)
+            self.meta = {}
+            for k, v in raw.items():
+                try:
+                    ik = int(k)
+                    self.meta[ik] = v
+                except Exception:
+                    self.meta[k] = v
         else:
             self.meta = {}
 
@@ -303,7 +321,10 @@ class EmbeddingIndex:
         else:
             self.index = None
 
-        self._next_int_id = (max(self.meta.keys()) + 1) if self.meta else 1
+        # sadece sayısal id'lere bakarak next id belirle
+        numeric_keys = [k for k in self.meta.keys() if isinstance(k, int)]
+        self._next_int_id = (max(numeric_keys) + 1) if numeric_keys else 1
+
 
     def _ensure_index(self, dim: int) -> None:
         if self.index is None:
