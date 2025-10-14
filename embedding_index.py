@@ -184,74 +184,40 @@ class EmbeddingIndex:
 
         return results
 
-    def ingest_markdown(
-        self,
-        url: str,
-        raw_markdown: str,
-        doc_type: str = "service",
-        chunk_size: int = 1500,
-        overlap: int = 200,
-    ) -> Dict[str, Any]:
+    def ingest_markdown(self,url: str,raw_markdown: str,doc_type: str = "service",chunk_size: int = 1500,overlap: int = 200,) -> Dict[str, Any]:
         """
-        Markdown dokümanı temizleyip chunk'lara böler ve FAISS'e ekler.
+        Markdown dokümanı temizleyip upsert_vector ile indeksler.
+        Full text sadece documents altında tutulur; chunk'lar doc_ref ile bağlanır.
         """
         if not self._is_valid_url(url):
             raise ValueError("invalid url")
 
         clean_md = self.clean_markdown(raw_markdown)
-        content_hash = self._sha1_of(clean_md)
-        title = None
+        if not clean_md.strip():
+            raise ValueError("empty markdown after cleaning")
+
+        # Başlık (opsiyonel)
         m = re.search(r"(?m)^#\s+(.+)$", clean_md)
-        if m:
-            title = m.group(1).strip()
+        title = m.group(1).strip() if m else None
 
-        # 🔥 Chunk işlemi burada
-        chunks = self._chunk_text_simple(clean_md, size=chunk_size, overlap=overlap)
-        total_chunks = len(chunks)
+        # upsert_vector tüm chunk + meta işini halleder
+        res = self.upsert_vector(
+            text=clean_md,
+            metadata={"url": url, "doc_type": doc_type.lower(), "title": title},
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
 
-        results = []
-        with self._lock:
-            for idx, chunk in enumerate(chunks):
-                v = self.model.encode(chunk)
-                if v.ndim == 1:
-                    v = v.reshape(1, -1)
-
-                dim = v.shape[1]
-                self._ensure_index(dim)
-                self._normalize(v)
-
-                cid = self._next_int_id
-                self._next_int_id += 1
-                self.index.add_with_ids(v, np.array([cid], dtype=np.int64))
-
-                self.meta[cid] = {
-                    "external_id": str(uuid.uuid4()),
-                    "text": chunk,
-                    "metadata": {
-                        "doc_type": doc_type.lower(),
-                        "url": url,
-                        "title": title,
-                        "chunk_index": idx,
-                        "total_chunks": total_chunks,
-                        "full_text": clean_md,
-                        "full_text_sha1": content_hash,
-                        "sha1": self._sha1_of(chunk),
-                    },
-                }
-
-                results.append({
-                    "chunk_index": idx,
-                    "faiss_id": cid,
-                    "url": url,
-                    "text": chunk,
-                })
-
-            self._save_state()
+        # Dönüş payload'ı (uyumlu ve özet)
+        doc_ref = res.get("doc_ref")
+        total_chunks = res.get("total_chunks")
+        dim = self.index.d if self.index is not None else None
 
         return {
             "success": True,
-            "page": {"url": url, "title": title, "language": "tr", "content_hash": content_hash},
-            "chunks": results,
+            "page": {"url": url, "title": title, "language": "tr"},
+            "doc_ref": doc_ref,
+            "total_chunks": total_chunks,
             "model": {"name": self.model_name, "dim": dim, "emb_ver": time.strftime("%Y-%m-%d")},
         }
 
@@ -268,23 +234,23 @@ class EmbeddingIndex:
         out = re.sub(r"https?://\S+", "", out)  # çıplak URL sil
         return out.strip()
 
-    @staticmethod
-    def _chunk_text_simple(self,itext: str, size: int = 1500, overlap: int = 200) -> List[str]:
+
+    def _chunk_text_simple(self, text: str, size: int = 1500, overlap: int = 200) -> List[Tuple[str, int, int, List[str]]]:
         """
         Düz metni sabit boyutlu parçalara böler.
         Her parça 4-tuple döner: (chunk_text, char_start, char_end, h_path)
         """
-        chunks = []
+        chunks: List[Tuple[str, int, int, List[str]]] = []
         n = len(text)
         start = 0
+        step = max(1, size - overlap)  # overlap >= size olursa kilitlenmesin
+
         while start < n:
             end = min(n, start + size)
             chunk_text = text[start:end]
-            # h_path basit default; istersen başlık/paragraf mantığını buraya entegre edebilirsin
             chunks.append((chunk_text, start, end, ["# Loose"]))
-            # en az 1 karakter ilerle (overlap >= size olursa kilitlenmesin)
-            step = max(1, size - overlap)
             start += step
+
         return chunks
 
     # =====================================================
