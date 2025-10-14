@@ -55,65 +55,81 @@ class EmbeddingIndex:
         vector: Optional[List[float]] = None,
         external_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        int_id: Optional[int] = None,
         chunk_size: int = 1500,
         overlap: int = 200,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
-        Uzun bir text'i chunk'lara bölerek FAISS'e ekler.
-        Her chunk ayrı embedding olarak kaydedilir.
-        Orijinal metin metadata içinde 'full_text' olarak saklanır.
+        Tek bir text için:
+        - Full metni sadece bir defa document-level metadata olarak saklar.
+        - Chunk'ları ayrı FAISS vektörleri olarak ekler.
         """
         if not text or not text.strip():
-            raise ValueError("Provide 'text' or 'vector'")
+            raise ValueError("Provide 'text'.")
 
+        # 🔐 Doc SHA1 ve doc_id oluştur
         full_text_sha1 = self._sha1_of(text)
-        results = []
+        doc_id = f"doc_{full_text_sha1[:12]}"
 
-        # 1️⃣ Chunk'lara böl
-        chunks = self._chunk_text_simple(text, size=chunk_size, overlap=overlap)
-        total_chunks = len(chunks)
+        # Eğer daha önce eklenmişse tekrar eklemeye gerek yok
+        if "documents" not in self.meta:
+            self.meta["documents"] = {}
+        if doc_id in self.meta["documents"]:
+            return {"doc_ref": doc_id, "status": "exists"}
 
+        # ✂️ Chunk'lara böl
+        chunks = self.chunk_text(text, target=chunk_size, overlap=overlap)
+        if not chunks:
+            raise ValueError("No chunks created from text.")
+
+        # 📚 Full text'i documents altına kaydet
+        self.meta["documents"][doc_id] = {
+            "url": (metadata or {}).get("url"),
+            "full_text_sha1": full_text_sha1,
+            "full_text": text,
+            "total_chunks": len(chunks),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        # 🔢 Chunk vektörlerini üret
+        chunk_texts = [c[0] for c in chunks]
+        vecs = self.model.encode(chunk_texts)
+        vecs = np.array(vecs, dtype=np.float32)
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+
+        dim = vecs.shape[1]
         with self._lock:
-            for idx, chunk in enumerate(chunks):
-                v = self.model.encode(chunk)
-                if not isinstance(v, np.ndarray):
-                    v = np.array(v, dtype=np.float32)
-                if v.ndim == 1:
-                    v = v.reshape(1, -1)
+            self._ensure_index(dim)
+            self._normalize(vecs)
 
-                dim = v.shape[1]
-                self._ensure_index(dim)
-                self._normalize(v)
+            start_id = self._next_int_id
+            ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
+            self._next_int_id += vecs.shape[0]
+            self.index.add_with_ids(vecs, ids)
 
-                chunk_id = self._next_int_id
-                self._next_int_id += 1
-                self.index.add_with_ids(v, np.array([chunk_id], dtype=np.int64))
-
-                # 🔎 meta bilgisi
-                self.meta[chunk_id] = {
-                    "external_id": external_id or str(uuid.uuid4()),
-                    "text": chunk,
+            # 🔗 Her chunk'ı FAISS meta'ya ekle
+            for i, (txt, s, e, h_path) in enumerate(chunks):
+                faiss_id = int(ids[i])
+                chunk_id = str(uuid.uuid4())
+                self.meta[faiss_id] = {
+                    "external_id": chunk_id,
+                    "text": txt,
                     "metadata": {
-                        **(metadata or {}),
-                        "chunk_index": idx,
-                        "total_chunks": total_chunks,
-                        "full_text_sha1": full_text_sha1,
-                        "full_text": text,
-                        "sha1": self._sha1_of(chunk),
-                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "doc_ref": doc_id,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "sha1": self._sha1_of(txt),
+                        "h_path": h_path,
                     },
                 }
 
-                results.append({
-                    "id": chunk_id,
-                    "external_id": self.meta[chunk_id]["external_id"],
-                    "chunk_index": idx,
-                    "total_chunks": total_chunks,
-                })
-
             self._save_state()
 
-        return results
+        return {"doc_ref": doc_id, "total_chunks": len(chunks), "faiss_ids": ids.tolist()}
+
+
+
 
     def search(
         self,
