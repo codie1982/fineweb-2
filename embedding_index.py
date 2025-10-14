@@ -78,7 +78,7 @@ class EmbeddingIndex:
             return {"doc_ref": doc_id, "status": "exists"}
 
         # ✂️ Chunk'lara böl
-        chunks = self.chunk_text(text, target=chunk_size, overlap=overlap)
+        chunks = self._chunk_text_simple(text, target=chunk_size, overlap=overlap)
         if not chunks:
             raise ValueError("No chunks created from text.")
 
