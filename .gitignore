@@ -220,3 +220,4 @@ __marimo__/
 faiss.index
 meta.json
 *.tmp
+processed_files.txt
