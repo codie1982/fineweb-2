@@ -282,7 +282,6 @@ def writer(in_q: Queue, stop_event: Event):
     try:
         store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
 
-        # Dup guard: mevcut meta'dan sha1 set'i oluştur
         seen_sha1 = set()
         for v in store.meta.values():
             h = (v.get("metadata") or {}).get("sha1")
@@ -294,7 +293,6 @@ def writer(in_q: Queue, stop_event: Event):
         last_flush_n = 0
         last_flush_t = time.time()
 
-        # heartbeat istatistikleri
         received_total = 0
         skipped_total  = 0
         kept_total     = 0
@@ -305,7 +303,7 @@ def writer(in_q: Queue, stop_event: Event):
         def heartbeat():
             nonlocal last_hb_t
             now = time.time()
-            if now - last_hb_t >= 60:  # her 60 saniyede bir
+            if now - last_hb_t >= 60:
                 log(f"[HB] recv={received_total} kept={kept_total} skipped={skipped_total} ntotal={store.index.ntotal if store.index else 0}", "WRITER", Fore.GREEN)
                 last_hb_t = now
 
@@ -322,23 +320,21 @@ def writer(in_q: Queue, stop_event: Event):
                     log(f"⚠️ Flush hatası: {e}", "WRITER", Fore.YELLOW)
 
         while True:
-            heartbeat()
-            maybe_flush()
-
-            if stop_event.is_set() and finished >= N_WORKERS:
+            # ÇIKIŞ KOŞULU: tüm worker'lardan 'None' alındıysa bitir
+            if finished >= N_WORKERS:
                 break
 
             try:
                 item = in_q.get(timeout=5)
             except queue.Empty:
-                if stop_event.is_set() and finished >= N_WORKERS:
-                    break
+                heartbeat()
+                maybe_flush()
+                # finished sayısı artmışsa bir sonraki turda break olacak
                 continue
 
             if item is None:
                 finished += 1
-                if stop_event.is_set() and finished >= N_WORKERS:
-                    break
+                # burada doğrudan continue; üstteki başta kontrol kıracak
                 continue
 
             vecs, texts, urls = item
@@ -346,10 +342,8 @@ def writer(in_q: Queue, stop_event: Event):
             if vecs.dtype == np.float16:
                 vecs = vecs.astype(np.float32)
 
-            
             received_total += len(texts)
 
-            # DUP GUARD
             keep_idx = []
             sha1_list = []
             local_skipped = 0
@@ -364,10 +358,12 @@ def writer(in_q: Queue, stop_event: Event):
 
             if not keep_idx:
                 heartbeat()
+                maybe_flush()
                 continue
 
             vecs = np.asarray(vecs, dtype=np.float32)
-            if vecs.ndim == 1: vecs = vecs.reshape(1, -1)
+            if vecs.ndim == 1:
+                vecs = vecs.reshape(1, -1)
             vecs = vecs[keep_idx, :]
             texts = [texts[i] for i in keep_idx]
             urls  = [urls[i]  for i in keep_idx]
@@ -400,6 +396,9 @@ def writer(in_q: Queue, stop_event: Event):
                 rps = total_added / max(dt, 1e-6)
                 log(f"[RATE] added={total_added} | {rps:.1f} vec/s", "WRITER", Fore.GREEN)
 
+            heartbeat()
+            maybe_flush()
+
         # son flush (atomik)
         try:
             flush_atomic(store)
@@ -408,7 +407,7 @@ def writer(in_q: Queue, stop_event: Event):
 
         log(f"✅ Writer tamamlandı. Toplam {total_added} vektör | {time.time()-t0:.1f}s", "WRITER", Fore.GREEN)
     except Exception as e:
-            log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
+        log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
 
 # -------------- MAIN --------------
 def main():
