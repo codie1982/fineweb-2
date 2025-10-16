@@ -394,7 +394,16 @@ def worker(in_q, out_q, stop_event, wid: int):
 # -------------- OPTIMIZED WRITER --------------
 def writer(in_q: Queue, stop_event: Event):
     try:
-        store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
+        # EmbeddingIndex'i doğru şekilde başlat
+        store = EmbeddingIndex(
+            model_name=MODEL_NAME, 
+            index_path=INDEX_PATH, 
+            meta_path=META_PATH
+        )
+        
+        # Başlangıç durumunu logla
+        initial_count = store.index.ntotal if store.index else 0
+        log(f"Writer başladı. Başlangıç index count: {initial_count}", "WRITER", Fore.GREEN)
 
         finished_workers = 0
         total_chunks_added = 0
@@ -402,46 +411,68 @@ def writer(in_q: Queue, stop_event: Event):
         last_hb = t0
         last_flush = t0
 
+        # Toplu işlem için buffer'lar
         ACC_VEC, ACC_TXT, ACC_URL = [], [], []
         FLUSH_ADD_EVERY = 2048
-
-        log("Writer başladı (optimized).", "WRITER", Fore.GREEN)
 
         def flush_add():
             nonlocal ACC_VEC, ACC_TXT, ACC_URL, total_chunks_added
             if not ACC_VEC:
                 return
                 
-            vecs = np.vstack(ACC_VEC).astype(np.float32, copy=False)
-            dim = vecs.shape[1]
-            
-            with store._lock:
-                store._ensure_index(dim)
-                store._normalize(vecs)
-                start_id = store._next_int_id
-                ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
-                store._next_int_id += vecs.shape[0]
-                store.index.add_with_ids(vecs, ids)
+            try:
+                vecs = np.vstack(ACC_VEC).astype(np.float32, copy=False)
+                dim = vecs.shape[1]
+                chunk_count = vecs.shape[0]
                 
-                for j, fid in enumerate(ids):
-                    store.meta[int(fid)] = {
-                        "external_id": os.urandom(8).hex(),
-                        "metadata": {
-                            "doc_type": DOC_TYPE,
-                            "url": ACC_URL[j],
-                        },
-                    }
+                with store._lock:
+                    store._ensure_index(dim)
+                    store._normalize(vecs)
                     
-            total_chunks_added += vecs.shape[0]
-            ACC_VEC.clear()
-            ACC_TXT.clear() 
-            ACC_URL.clear()
+                    # ID'leri oluştur
+                    start_id = store._next_int_id
+                    ids = np.arange(start_id, start_id + chunk_count, dtype=np.int64)
+                    store._next_int_id += chunk_count
+                    
+                    # FAISS'e ekle
+                    store.index.add_with_ids(vecs, ids)
+                    
+                    # Meta verileri ekle - DÜZELTİLDİ
+                    for j, fid in enumerate(ids):
+                        faiss_id = int(fid)
+                        store.meta[faiss_id] = {
+                            "external_id": os.urandom(8).hex(),
+                            "text": ACC_TXT[j],  # Metni de kaydet
+                            "metadata": {
+                                "doc_type": DOC_TYPE,
+                                "url": ACC_URL[j],
+                                "chunk_index": j,
+                                "total_chunks": chunk_count,
+                                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                            },
+                        }
+                    
+                    # Hemen kaydet - ÖNEMLİ
+                    store._save_state()
+                    
+                total_chunks_added += chunk_count
+                log(f"Writer: {chunk_count} chunk eklendi (toplam: {total_chunks_added})", "WRITER", Fore.GREEN)
+                
+            except Exception as e:
+                log(f"❌ Writer flush_add hatası: {e}", "WRITER", Fore.RED)
+                import traceback
+                traceback.print_exc()
+            finally:
+                ACC_VEC.clear()
+                ACC_TXT.clear() 
+                ACC_URL.clear()
 
-        while finished_workers < N_WORKERS:
+        # Ana döngü
+        while finished_workers < N_WORKERS and not stop_event.is_set():
             current_time = time.time()
             
             # Periodic flush
-            if current_time - last_flush > 30 and ACC_VEC:  # 30 saniyede bir flush
+            if current_time - last_flush > 30 and ACC_VEC:
                 flush_add()
                 last_flush = current_time
                 
@@ -450,14 +481,14 @@ def writer(in_q: Queue, stop_event: Event):
                 ntotal = store.index.ntotal if store.index else 0
                 dt = current_time - t0
                 rps = total_chunks_added / max(dt, 1e-6)
-                log(f"[HB] chunks={total_chunks_added} ntotal={ntotal} rate={rps:.1f} vec/s", 
+                meta_size = len(str(store.meta))
+                log(f"[HB] chunks={total_chunks_added} ntotal={ntotal} rate={rps:.1f} vec/s meta_entries={len(store.meta)}", 
                     "WRITER", Fore.CYAN)
                 last_hb = current_time
 
             try:
                 item = in_q.get(timeout=2.0)
             except queue.Empty:
-                # Zaman aşımında flush kontrolü
                 if ACC_VEC and sum(v.shape[0] for v in ACC_VEC) >= FLUSH_ADD_EVERY:
                     flush_add()
                 continue
@@ -470,6 +501,7 @@ def writer(in_q: Queue, stop_event: Event):
                 log(f"Writer: {finished_workers}/{N_WORKERS} worker tamamlandı", "WRITER", Fore.GREEN)
                 continue
 
+            # Veriyi işle
             vecs, texts, urls = item
             ACC_VEC.append(np.asarray(vecs, dtype=np.float32))
             ACC_TXT.extend(texts)
@@ -483,20 +515,27 @@ def writer(in_q: Queue, stop_event: Event):
         if ACC_VEC:
             flush_add()
             
-        flush_atomic(store)
+        # Atomik kaydetme
+        try:
+            with store._lock:
+                store._save_state()
+            log(f"Writer: Final state kaydedildi. Toplam chunks: {total_chunks_added}", "WRITER", Fore.GREEN)
+        except Exception as e:
+            log(f"❌ Final kaydetme hatası: {e}", "WRITER", Fore.RED)
 
+        # Son istatistikler
         dt = time.time() - t0
         rps = total_chunks_added / max(dt, 1e-6)
         ntotal = store.index.ntotal if store.index else 0
+        meta_count = len([k for k in store.meta.keys() if isinstance(k, int)])
         
-        log(f"✅ Writer tamamlandı. chunks={total_chunks_added} | {dt:.1f}s ~{rps:.1f} vec/s | ntotal={ntotal}",
+        log(f"✅ Writer tamamlandı. chunks={total_chunks_added} | {dt:.1f}s ~{rps:.1f} vec/s | ntotal={ntotal} meta_entries={meta_count}",
             "WRITER", Fore.GREEN)
 
     except Exception as e:
         log(f"❌ Writer hatası: {e}", "WRITER", Fore.RED)
         import traceback
         traceback.print_exc()
-
 # -------------- OPTIMIZED MAIN --------------
 def main():
     try:
