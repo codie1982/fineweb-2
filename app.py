@@ -44,7 +44,8 @@ BATCH_READ       = 8192  # Artırıldı
 MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
-
+TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
+URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 # Kuyruk boyutları optimize edildi
 Q_R2W_SIZE       = N_WORKERS * 500  # Worker sayısına göre skalala
 Q_W2WR_SIZE      = N_WORKERS * 300
