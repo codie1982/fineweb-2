@@ -33,7 +33,8 @@ def log(msg, tag="SYS", color=Fore.CYAN):
     else: print(line, flush=True)
 
 # --- ayarlar ---
-ROOT_DIR   = "./fineweb-2/data/tur_Latn/train"
+ROOT_DIR = os.path.abspath("./fineweb-2/data/tur_Latn/train")
+log(f"ROOT_DIR: {ROOT_DIR} | exists={os.path.exists(ROOT_DIR)}", "SYS")
 INDEX_PATH = os.path.abspath("faiss.index")
 META_JSONL = os.path.abspath("meta.jsonl")
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
