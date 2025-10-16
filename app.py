@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Multiprocessing ingest + resume (processed_files) + safe shutdown + atomic checkpoint + dup guard + heartbeat.
-Paralel encode (worker), toplu FAISS add (writer), ayrıntılı log.
+Optimized multiprocessing ingest - CPU verimliliği artırıldı
 """
 
 import os, glob, queue, time, datetime, sys, signal, atexit, json, hashlib
 from typing import List, Optional, Set
-from multiprocessing import Process, Queue, Event, set_start_method
+from multiprocessing import Process, Queue, Event, set_start_method, cpu_count
+import threading
 
 import numpy as np
 import pyarrow.dataset as ds
@@ -14,7 +14,7 @@ import faiss
 import torch
 from sentence_transformers import SentenceTransformer
 
-# --- colorama (opsiyonel) ---
+# --- colorama ---
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
@@ -25,39 +25,45 @@ except Exception:
         def __getattr__(self, k): return ""
     Fore = Style = _Dummy()
 
-# --- FAISS sarmalayıcı ---
 from embedding_index import EmbeddingIndex
 
-# ============== AYARLAR ==============
+# ============== OPTIMIZED AYARLAR ==============
 ROOT_DIR         = "./fineweb-2/data/tur_Latn/train"
 INDEX_PATH       = "faiss.index"
 META_PATH        = "meta.json"
 MODEL_NAME       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
-N_WORKERS        = 12
-LIMIT_TOTAL      = 100              # Tüm veri için None ya da çok büyük sayı ver
-BATCH_READ       = 4096
+# CPU sayısına göre otomatik ayar
+AVAILABLE_CPUS = cpu_count()
+N_WORKERS        = min(AVAILABLE_CPUS - 2, 16)  # 2 core reader+writer için
+if N_WORKERS < 4:
+    N_WORKERS = 4
+
+LIMIT_TOTAL      = 100
+BATCH_READ       = 8192  # Artırıldı
 MIN_CHARS        = 80
 MAX_CHARS        = 8000
 DOC_TYPE         = "fineweb2"
-MAX_TEXT_CHARS   = None             # kırpma yok (chunk/encode worker’da)
-TEXT_CANDS       = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
-URL_CANDS        = ["url","source_url","link","origin","canonical_url"]
 
-Q_R2W_SIZE       = 2000
-Q_W2WR_SIZE      = 2000
+# Kuyruk boyutları optimize edildi
+Q_R2W_SIZE       = N_WORKERS * 500  # Worker sayısına göre skalala
+Q_W2WR_SIZE      = N_WORKERS * 300
 
-LOG_FILE         = None             # örn: "logs/ingest.log"
+LOG_FILE         = None
 WRITER_POISON    = "__WRITER_POISON__"
-# --- throughput ayarları ---
-READ_DISPATCH    = 4096   # reader -> worker tek mesajda kaç satır gönderecek
-CHUNK_SIZE       = 1500   # chunk uzunluğu (karakter)
-CHUNK_OVERLAP    = 200    # chunk overlap (karakter)
-ENC_BATCH        = 512    # encode batch size (GPU: 256–1024, CPU: 64–256)
 
+# Throughput ayarları optimize edildi
+READ_DISPATCH    = 8192   # Artırıldı
+CHUNK_SIZE       = 1500
+CHUNK_OVERLAP    = 200
+ENC_BATCH        = 256    # Batch boyutu optimize edildi
+
+# Yeni: Paralellik kontrolleri
+MAX_QUEUE_WAIT   = 0.1    # Queue timeout (saniye)
+FLUSH_INTERVAL   = 1000   # Writer flush interval
 # =====================================
 
-# --------- Global Model (fork öncesi preload için) ---------
+# Global Model
 MODEL = None
 
 def _stamp() -> str:
@@ -121,7 +127,6 @@ def text_sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 def flush_atomic(store: EmbeddingIndex):
-    """meta.json ve faiss.index'i temp'e yazıp atomik replace."""
     try:
         meta_tmp = store.meta_path + ".tmp"
         with open(meta_tmp, "w", encoding="utf-8") as f:
@@ -135,7 +140,6 @@ def flush_atomic(store: EmbeddingIndex):
         log(f"⚠️ flush_atomic hata: {e}", "WRITER", Fore.YELLOW)
 
 def preload_model():
-    """Worker’ları fork etmeden ÖNCE modeli yükle (copy-on-write ile paylaşım)."""
     global MODEL
     if MODEL is not None:
         return MODEL
@@ -143,13 +147,31 @@ def preload_model():
         torch.set_num_threads(1)
     except Exception:
         pass
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Device detection optimize edildi
+    if torch.cuda.is_available():
+        device = "cuda"
+        torch.backends.cudnn.benchmark = True  # CUDA optimizasyonu
+    else:
+        device = "cpu"
+        # CPU için thread ayarı
+        torch.set_num_threads(min(4, AVAILABLE_CPUS // N_WORKERS))
+    
     MODEL = SentenceTransformer(MODEL_NAME, device=device)
     MODEL.eval()
-    log(f"Encoder hazır: {MODEL_NAME} | device={device}", "SYS", Fore.CYAN)
+    
+    # Mixed precision için hazırlık
+    if device == "cuda":
+        try:
+            MODEL = MODEL.half()
+            log(f"Model FP16 mode enabled", "SYS", Fore.CYAN)
+        except Exception as e:
+            log(f"FP16 not available: {e}", "SYS", Fore.YELLOW)
+    
+    log(f"Encoder hazır: {MODEL_NAME} | device={device} | workers={N_WORKERS}", "SYS", Fore.CYAN)
     return MODEL
 
-# -------------- READER --------------
+# -------------- OPTIMIZED READER --------------
 def reader(files: List[str], out_q: Queue, stop_event: Event):
     sent = 0
     total_limit = LIMIT_TOTAL if isinstance(LIMIT_TOTAL, int) else float("inf")
@@ -158,18 +180,31 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
     log(f"Reader başladı: {len(files)} dosya (atlanan={len(seen_files)}, işlenecek={len(todo)}).", "READER", Fore.BLUE)
 
     batch_T, batch_U = [], []
-    def flush_reader_batch():
-        nonlocal batch_T, batch_U, sent
-        if not batch_T:
-            return
-        out_q.put((batch_T, batch_U))      # 🎯 tek mesaj = binlerce satır
-        sent += len(batch_T)
-        batch_T, batch_U = [], []
+    batch_count = 0
+    
+    def flush_reader_batch(force=False):
+        nonlocal batch_T, batch_U, sent, batch_count
+        if (batch_count > 0 and (force or batch_count >= READ_DISPATCH)):
+            try:
+                out_q.put((batch_T.copy(), batch_U.copy()), timeout=MAX_QUEUE_WAIT)
+                sent += batch_count
+                log(f"Reader: {batch_count} satır gönderildi (toplam: {sent})", "READER", Fore.BLUE)
+            except queue.Full:
+                log("⚠️ Reader queue dolu, bekleniyor...", "READER", Fore.YELLOW)
+                time.sleep(0.1)
+                return False
+            
+            batch_T.clear()
+            batch_U.clear()
+            batch_count = 0
+        return True
 
-    for path in todo:
-        log(f"[FILE] reading: {path}", "READER", Fore.BLUE)
+    for path_idx, path in enumerate(todo):
         if stop_event.is_set() or sent >= total_limit:
             break
+            
+        log(f"[FILE {path_idx+1}/{len(todo)}] reading: {os.path.basename(path)}", "READER", Fore.BLUE)
+        
         try:
             ds_ = ds.dataset(path, format="parquet")
         except Exception as e:
@@ -187,33 +222,54 @@ def reader(files: List[str], out_q: Queue, stop_event: Event):
 
         scanner = ds_.scanner(columns=[tcol] + ([ucol] if ucol else []),
                               batch_size=BATCH_READ, use_threads=True)
-        for b in scanner.to_batches():
-            if stop_event.is_set(): break
+        
+        for batch_idx, b in enumerate(scanner.to_batches()):
+            if stop_event.is_set() or sent >= total_limit: 
+                break
+                
             d = b.to_pydict()
             texts = d.get(tcol, [])
             urls  = d.get(ucol, []) if ucol else [None]*len(texts)
+            
             for i, t in enumerate(texts):
-                if stop_event.is_set() or sent >= total_limit: break
-                if not t: continue
+                if stop_event.is_set() or sent >= total_limit: 
+                    break
+                if not t: 
+                    continue
+                    
                 s = str(t).strip()
-                if not (MIN_CHARS <= len(s) <= MAX_CHARS): continue
+                if not (MIN_CHARS <= len(s) <= MAX_CHARS): 
+                    continue
+                    
                 u = urls[i] if urls and urls[i] else f"http://fw2.local/{os.path.basename(path)}-{i}"
 
-                # 🔹 tek tek put etmek yerine paketle
                 batch_T.append(s)
                 batch_U.append(u)
+                batch_count += 1
 
-                if len(batch_T) >= READ_DISPATCH:
-                    flush_reader_batch()
+                # Daha sık flush ile memory kullanımını optimize et
+                if batch_count >= READ_DISPATCH:
+                    if not flush_reader_batch(force=True):
+                        # Queue doluysa biraz bekle
+                        time.sleep(0.05)
 
-        flush_reader_batch()     # dosya bitişinde elde kalanları gönder
+        # Dosya bitişinde flush
+        flush_reader_batch(force=True)
         mark_processed(path)
 
-    # worker'lara bitiş sinyali
+    # Son flush
+    flush_reader_batch(force=True)
+    
+    # Worker'lara bitiş sinyali
     for _ in range(N_WORKERS):
-        out_q.put(None)
-    log(f"✅ Reader bitti. Kuyruğa {sent} satır gönderildi (paketli).", "READER", Fore.BLUE)
-# -------------- WORKER: encode + ilet --------------
+        try:
+            out_q.put(None, timeout=1.0)
+        except queue.Full:
+            log("⚠️ Bitiş sinyali gönderilemedi, queue dolu", "READER", Fore.YELLOW)
+            
+    log(f"✅ Reader bitti. Toplam {sent} satır gönderildi.", "READER", Fore.BLUE)
+
+# -------------- OPTIMIZED WORKER --------------
 def _chunk_simple(s: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     n = len(s)
     step = max(1, size - overlap)
@@ -222,113 +278,142 @@ def _chunk_simple(s: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
         yield s[start:end]
 
 def worker(in_q, out_q, stop_event, wid: int):
-    import gc, time
-    try: torch.set_num_threads(1)
-    except Exception: pass
-    try: faiss.omp_set_num_threads(1)
-    except Exception: pass
+    import gc
+    
+    # Thread ayarları optimize edildi
+    try: 
+        torch.set_num_threads(1)
+        faiss.omp_set_num_threads(1)
+    except Exception: 
+        pass
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    
+    # Model loading optimize edildi
     global MODEL
     if MODEL is None:
         MODEL = SentenceTransformer(MODEL_NAME, device=device)
         MODEL.eval()
         if device == "cuda":
-            try: MODEL = MODEL.half()
-            except Exception: pass
-    model = MODEL  # paylaşılan nesneyi kullan
-
-    # GPU'da mümkünse fp16 (VRAM/hız kazancı)
-    if device == "cuda":
-        try: model = model.half()
-        except Exception: pass
+            try: 
+                MODEL = MODEL.half()
+            except Exception: 
+                pass
+    model = MODEL
 
     log(f"Worker-{wid} başladı. device={device}", f"W{wid}", Fore.MAGENTA)
-
-    while True:
-        if stop_event.is_set():
-            out_q.put(None)
-            break
-
+    
+    processed_count = 0
+    last_log_time = time.time()
+    
+    while not stop_event.is_set():
         try:
-            item = in_q.get(timeout=1.5)
+            item = in_q.get(timeout=0.5)  # Daha kısa timeout
+            if item is None:
+                break
+                
+            texts, urls = item
+            processed_count += len(texts)
+            
+            # Batch processing optimize edildi
+            batch_texts, batch_urls = [], []
+            for s, u in zip(texts, urls):
+                if not s: 
+                    continue
+                s = s.strip()
+                if not s: 
+                    continue
+                    
+                for ch in _chunk_simple(s):
+                    if len(ch) >= MIN_CHARS:
+                        batch_texts.append(ch)
+                        batch_urls.append(u)
+
+            if not batch_texts:
+                continue
+
+            # Encode işlemi
+            vecs_out = []
+            t0 = time.time()
+            
+            with torch.inference_mode():
+                for i in range(0, len(batch_texts), ENC_BATCH):
+                    sub = batch_texts[i:i+ENC_BATCH]
+                    v = model.encode(
+                        sub,
+                        batch_size=ENC_BATCH,
+                        show_progress_bar=False,
+                        normalize_embeddings=True,
+                        convert_to_tensor=True  # GPU için optimize
+                    )
+                    vecs_out.append(v.cpu().numpy() if device == "cuda" else np.asarray(v))
+
+            vecs = np.vstack(vecs_out) if len(vecs_out) > 1 else vecs_out[0]
+            dt = time.time() - t0
+
+            # Writer'a gönder
+            try:
+                out_q.put((vecs, batch_texts, batch_urls), timeout=MAX_QUEUE_WAIT)
+            except queue.Full:
+                log(f"⚠️ Worker-{wid}: Writer queue dolu, bekleniyor...", f"W{wid}", Fore.YELLOW)
+                time.sleep(0.1)
+                # Tekrar dene
+                try:
+                    out_q.put((vecs, batch_texts, batch_urls), timeout=MAX_QUEUE_WAIT)
+                except queue.Full:
+                    log(f"❌ Worker-{wid}: Writer queue doldu, batch kaybedildi", f"W{wid}", Fore.RED)
+
+            # Performans logging
+            current_time = time.time()
+            if current_time - last_log_time > 30:  # 30 saniyede bir log
+                rate = processed_count / (current_time - last_log_time) if current_time > last_log_time else 0
+                log(f"Worker-{wid}: {processed_count} docs | {rate:.1f} doc/s", f"W{wid}", Fore.MAGENTA)
+                processed_count = 0
+                last_log_time = current_time
+
+            # Bellek optimizasyonu
+            if len(vecs_out) > 1:
+                del vecs_out
+            gc.collect()
+
         except queue.Empty:
             continue
-
-        if item is None:
-            out_q.put(None)
-            break
-
-        # 🎯 reader'dan paket gelir: (list_of_texts, list_of_urls)
-        texts, urls = item
-
-        # 1) paket içindeki tüm metinleri chunk'la → tek dev batch
-        batch_texts, batch_urls = [], []
-        for s, u in zip(texts, urls):
-            if not s: continue
-            s = s.strip()
-            if not s: continue
-            for ch in _chunk_simple(s):
-                if len(ch) < MIN_CHARS:  # çok kısa chunk'ı at
-                    continue
-                batch_texts.append(ch)
-                batch_urls.append(u)
-
-        if not batch_texts:
+        except Exception as e:
+            log(f"❌ Worker-{wid} hata: {e}", f"W{wid}", Fore.RED)
             continue
 
-        # 2) büyük batch encode (parça parça)
-        vecs_out = []
-        t0 = time.time()
-        with torch.inference_mode():
-            for i in range(0, len(batch_texts), ENC_BATCH):
-                sub = batch_texts[i:i+ENC_BATCH]
-                v = model.encode(
-                    sub,
-                    batch_size=ENC_BATCH,
-                    show_progress_bar=False,
-                    normalize_embeddings=True
-                )
-                vecs_out.append(np.asarray(v, dtype=np.float32))
-
-        vecs = np.vstack(vecs_out) if len(vecs_out) > 1 else vecs_out[0]
-        dt = time.time() - t0
-
-        # 3) writer'a tek vuruşta gönder
-        out_q.put((vecs, batch_texts, batch_urls))
-        log(f"Worker-{wid}: sent {vecs.shape[0]} chunks in {dt*1000:.0f}ms "
-            f"(~{vecs.shape[0]/max(dt,1e-6):.1f} vec/s)", f"W{wid}", Fore.MAGENTA)
-
-        # bellek toparla
-        del vecs_out; gc.collect()
-
+    # Bitiş sinyali
+    try:
+        out_q.put(None, timeout=1.0)
+    except queue.Full:
+        pass
+        
     log(f"Worker-{wid} tamamlandı.", f"W{wid}", Fore.MAGENTA)
 
-# -------------- WRITER: toplu FAISS add + atomik flush --------------
+# -------------- OPTIMIZED WRITER --------------
 def writer(in_q: Queue, stop_event: Event):
     try:
         store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
 
-        finished = 0
+        finished_workers = 0
         total_chunks_added = 0
         t0 = time.time()
         last_hb = t0
-        last_rate_n = 0
-        HB_EVERY_S = 30
-        RATE_EVERY = 10000
+        last_flush = t0
 
         ACC_VEC, ACC_TXT, ACC_URL = [], [], []
-        FLUSH_ADD_EVERY = 2048   # 2k vektörde bir FAISS.add
+        FLUSH_ADD_EVERY = 2048
 
-        log("Writer başladı (sadece add).", "WRITER", Fore.GREEN)
+        log("Writer başladı (optimized).", "WRITER", Fore.GREEN)
 
         def flush_add():
             nonlocal ACC_VEC, ACC_TXT, ACC_URL, total_chunks_added
             if not ACC_VEC:
                 return
+                
             vecs = np.vstack(ACC_VEC).astype(np.float32, copy=False)
             dim = vecs.shape[1]
+            
             with store._lock:
                 store._ensure_index(dim)
                 store._normalize(vecs)
@@ -336,49 +421,52 @@ def writer(in_q: Queue, stop_event: Event):
                 ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
                 store._next_int_id += vecs.shape[0]
                 store.index.add_with_ids(vecs, ids)
+                
                 for j, fid in enumerate(ids):
                     store.meta[int(fid)] = {
                         "external_id": os.urandom(8).hex(),
-                        # metni yazmıyoruz → meta.json küçük kalır
                         "metadata": {
                             "doc_type": DOC_TYPE,
                             "url": ACC_URL[j],
                         },
                     }
+                    
             total_chunks_added += vecs.shape[0]
-            ACC_VEC.clear(); ACC_TXT.clear(); ACC_URL.clear()
+            ACC_VEC.clear()
+            ACC_TXT.clear() 
+            ACC_URL.clear()
 
-        while True:
-            now = time.time()
-            if now - last_hb >= HB_EVERY_S:
+        while finished_workers < N_WORKERS:
+            current_time = time.time()
+            
+            # Periodic flush
+            if current_time - last_flush > 30 and ACC_VEC:  # 30 saniyede bir flush
+                flush_add()
+                last_flush = current_time
+                
+            # Heartbeat
+            if current_time - last_hb >= 30:
                 ntotal = store.index.ntotal if store.index else 0
-                meta_size = os.path.getsize(store.meta_path) if os.path.exists(store.meta_path) else 0
-                idx_size  = os.path.getsize(store.index_path) if os.path.exists(store.index_path) else 0
-                log(f"[HB] chunks={total_chunks_added} ntotal={ntotal} "
-                    f"meta={_fmt_bytes(meta_size)} index={_fmt_bytes(idx_size)}",
+                dt = current_time - t0
+                rps = total_chunks_added / max(dt, 1e-6)
+                log(f"[HB] chunks={total_chunks_added} ntotal={ntotal} rate={rps:.1f} vec/s", 
                     "WRITER", Fore.CYAN)
-                last_hb = now
-
-            if total_chunks_added - last_rate_n >= RATE_EVERY:
-                dt = max(now - t0, 1e-6)
-                rps = total_chunks_added / dt
-                log(f"[RATE] chunks={total_chunks_added} | {rps:.1f} vec/s", "WRITER", Fore.CYAN)
-                last_rate_n = total_chunks_added
-
-            if finished >= N_WORKERS:
-                break
+                last_hb = current_time
 
             try:
-                item = in_q.get(timeout=5)
+                item = in_q.get(timeout=2.0)
             except queue.Empty:
-                if ACC_VEC:
+                # Zaman aşımında flush kontrolü
+                if ACC_VEC and sum(v.shape[0] for v in ACC_VEC) >= FLUSH_ADD_EVERY:
                     flush_add()
                 continue
 
             if item == WRITER_POISON:
                 break
+                
             if item is None:
-                finished += 1
+                finished_workers += 1
+                log(f"Writer: {finished_workers}/{N_WORKERS} worker tamamlandı", "WRITER", Fore.GREEN)
                 continue
 
             vecs, texts, urls = item
@@ -386,32 +474,38 @@ def writer(in_q: Queue, stop_event: Event):
             ACC_TXT.extend(texts)
             ACC_URL.extend(urls)
 
+            # Batch flush
             if sum(v.shape[0] for v in ACC_VEC) >= FLUSH_ADD_EVERY:
                 flush_add()
 
-        flush_add()
+        # Final flush
+        if ACC_VEC:
+            flush_add()
+            
         flush_atomic(store)
 
         dt = time.time() - t0
         rps = total_chunks_added / max(dt, 1e-6)
         ntotal = store.index.ntotal if store.index else 0
-        meta_size = os.path.getsize(store.meta_path) if os.path.exists(store.meta_path) else 0
-        idx_size  = os.path.getsize(store.index_path) if os.path.exists(store.index_path) else 0
-        log(f"✅ Writer tamamlandı. chunks={total_chunks_added} | {dt:.1f}s ~{rps:.1f} vec/s "
-            f"| ntotal={ntotal} meta={_fmt_bytes(meta_size)} index={_fmt_bytes(idx_size)}",
+        
+        log(f"✅ Writer tamamlandı. chunks={total_chunks_added} | {dt:.1f}s ~{rps:.1f} vec/s | ntotal={ntotal}",
             "WRITER", Fore.GREEN)
 
     except Exception as e:
-        log(f"⚠️ Writer hatası: {e}", "WRITER", Fore.YELLOW)
+        log(f"❌ Writer hatası: {e}", "WRITER", Fore.RED)
+        import traceback
+        traceback.print_exc()
 
-# -------------- MAIN --------------
+# -------------- OPTIMIZED MAIN --------------
 def main():
     try:
         set_start_method("fork", force=True)
     except RuntimeError:
         pass
 
-    # ÖNEMLİ: fork’tan önce modeli yükle (Linux/Unix’te bellek paylaşılır)
+    log(f"Sistem: {AVAILABLE_CPUS} CPU core | {N_WORKERS} worker", "SYS", Fore.CYAN)
+
+    # Model preload
     preload_model()
 
     pf = ensure_processed_file_exists()
@@ -423,9 +517,12 @@ def main():
         sys.exit(1)
 
     stop_event = Event()
+    
+    # Kuyruklar
     q_r2w  = Queue(maxsize=Q_R2W_SIZE)
     q_w2wr = Queue(maxsize=Q_W2WR_SIZE)
 
+    # Processes
     p_reader = Process(target=reader, args=(files, q_r2w, stop_event), daemon=True)
     p_writer = Process(target=writer, args=(q_w2wr, stop_event), daemon=False)
     workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True)
@@ -434,47 +531,53 @@ def main():
     def graceful_shutdown(signum=None, frame=None):
         log(f"⚠️ Sinyal alındı ({signum}). Kapanış başlatılıyor…", "SYS", Fore.YELLOW)
         stop_event.set()
+        
+        # Kuyrukları temizle
         try:
-            for _ in range(N_WORKERS): q_r2w.put_nowait(None)
-        except Exception: pass
+            while not q_r2w.empty():
+                q_r2w.get_nowait()
+        except: pass
+            
         try:
             q_w2wr.put_nowait(WRITER_POISON)
-        except Exception: pass
+        except: pass
 
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
     atexit.register(lambda: stop_event.set())
 
     t0 = time.time()
+    
+    # Başlatma sırası önemli
     p_writer.start()
-    for p in workers: p.start()
+    for p in workers: 
+        p.start()
     p_reader.start()
 
     try:
         p_reader.join()
-        for p in workers: p.join()
-
-        try:
-            q_w2wr.put_nowait(WRITER_POISON)  # tek writer olduğu için 1 poison yeter
-        except Exception:
-            pass
-
-        p_writer.join()
+        log("Reader tamamlandı, worker'lar bekleniyor...", "SYS", Fore.CYAN)
+        
+        for p in workers: 
+            p.join(timeout=30)  # Timeout ile
+            
+        log("Worker'lar tamamlandı, writer bekleniyor...", "SYS", Fore.CYAN)
+        
+        q_w2wr.put(WRITER_POISON, timeout=10)
+        p_writer.join(timeout=30)
 
     except KeyboardInterrupt:
         graceful_shutdown(signal.SIGINT, None)
-        for p in workers:
-            p.join(timeout=5)
-            if p.is_alive(): p.terminate()
-        try:
-            q_w2wr.put_nowait(WRITER_POISON)
-        except Exception: pass
-        p_writer.join(timeout=10)
-        if p_writer.is_alive(): p_writer.terminate()
-
+        
     finally:
+        # Zorla temizlik
+        for p in workers:
+            if p.is_alive():
+                p.terminate()
+        if p_writer.is_alive():
+            p_writer.terminate()
+            
         log(f"🏁 Toplam süre: {time.time()-t0:.1f}s", "SYS", Fore.CYAN)
-        log(f"FAISS: {INDEX_PATH} | META: {META_PATH}", "SYS", Fore.CYAN)
 
 if __name__ == "__main__":
     main()
