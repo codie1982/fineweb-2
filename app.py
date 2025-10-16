@@ -33,7 +33,8 @@ from embedding_index import EmbeddingIndex
 # ================== AYARLAR ==================
 ROOT_DIR   = "./fineweb-2/data/tur_Latn/train"
 INDEX_PATH = os.path.abspath("faiss.index")
-META_PATH  = os.path.abspath("meta.json")
+META_PATH  = os.path.abspath("meta.json")     # kullanılmayacak ama dursun
+META_JSONL = os.path.abspath("meta.jsonl")    # <-- yeni
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 CPUS      = cpu_count()
@@ -48,13 +49,13 @@ DOC_TYPE    = "fineweb2"
 TEXT_CANDS  = ["text","content","document","page_content","raw_content","body","clean_text","html_text","markdown"]
 URL_CANDS   = ["url","source_url","link","origin","canonical_url"]
 
-Q_R2W_SIZE  = N_WORKERS * 400
-Q_W2WR_SIZE = N_WORKERS * 200
+Q_R2W_SIZE  = N_WORKERS * 50
+Q_W2WR_SIZE = N_WORKERS * 50
 
-READ_DISPATCH = 8192        # reader->worker paket büyüklüğü
-CHUNK_SIZE    = 1500
-CHUNK_OVERLAP = 200
-ENC_BATCH     = 256         # CPU: 128–512 deneyebilirsin
+READ_DISPATCH = 2048        # reader->worker paket büyüklüğü
+CHUNK_SIZE    = 1200
+CHUNK_OVERLAP = 150
+ENC_BATCH     = 128         # CPU: 128–512 deneyebilirsin
 
 FLUSH_ADD_EVERY = 2048      # writer add eşiği
 HEARTBEAT_EVERY = 30         # saniye
@@ -242,7 +243,7 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         vecs = np.vstack(vecs_out) if len(vecs_out) > 1 else vecs_out[0]
         enc_dt = (time.time() - t0)
 
-        out_q.put((vecs, chunks, churn))
+        out_q.put((vecs, None))
 
         if time.time() - last_log >= HEARTBEAT_EVERY:
             r = len(chunks) / max(enc_dt, 1e-6)
@@ -255,150 +256,153 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
 
 # ---- WRITER ----
 def writer(in_q: Queue, stop_event: Event):
-    # Tek thread; oversubscription yok
-    try: faiss.omp_set_num_threads(1)
-    except Exception: pass
-    try: torch.set_num_threads(1)
-    except Exception: pass
+    try:
+        try: faiss.omp_set_num_threads(1)
+        except: pass
+        try: torch.set_num_threads(1)
+        except: pass
 
-    # Başlangıç logu: CWD ve hedef dosyalar
-    log(f"Writer başlıyor | CWD={os.getcwd()} | INDEX={INDEX_PATH} | META={META_PATH}", "WRITER", Fore.GREEN)
+        # FAISS index: sadece index’i tutacağız (meta’yı RAM’de tutmuyoruz)
+        store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
+        log(f"Writer başladı | CWD={os.getcwd()} | INDEX={INDEX_PATH} | JSONL={META_JSONL}", "WRITER", Fore.GREEN)
 
-    # EmbeddingIndex mutlak pathlerle
-    store = EmbeddingIndex(model_name=MODEL_NAME, index_path=INDEX_PATH, meta_path=META_PATH)
-    nt0 = store.index.ntotal if store.index else 0
-    log(f"Writer hazır | ntotal={nt0}", "WRITER", Fore.GREEN)
+        # JSONL dosyasını append modunda aç (satır başına bir meta)
+        os.makedirs(os.path.dirname(META_JSONL) or ".", exist_ok=True)
+        meta_f = open(META_JSONL, "a", encoding="utf-8", buffering=1)  # satır-bazlı, line-buffered
 
-    finished = 0
-    added = 0
+        finished = 0
+        added = 0
+        last_hb = time.time()
+        last_ckpt = time.time()
 
-    ACC_V, ACC_T, ACC_U = [], [], []
-    FLUSH_ADD_EVERY = 2048
-    HEARTBEAT_EVERY = 30
-    PERIODIC_FLUSH  = 5   # ← test için sık flush; sonra 20–30 yaparsın
+        ACC_V = []
+        ACC_U = []                # urls
+        FLUSH_ADD_EVERY = 2048
+        CKPT_EVERY_SEC  = 10      # her 10 sn’de index checkpoint
 
-    last_hb = time.time()
-    last_flush = time.time()
-
-    def log_sizes(prefix=""):
-        try:
-            ms = os.path.getsize(META_PATH) if os.path.exists(META_PATH) else 0
-            isz = os.path.getsize(INDEX_PATH) if os.path.exists(INDEX_PATH) else 0
-            log(f"{prefix}meta={ms/1024/1024:.2f}MB index={isz/1024/1024:.2f}MB", "WRITER", Fore.CYAN)
-        except Exception as e:
-            log(f"Boyut ölçüm hatası: {e}", "WRITER", Fore.YELLOW)
-
-    def flush_add(force=False):
-        nonlocal ACC_V, ACC_T, ACC_U, added, last_flush
-        n_acc = sum(v.shape[0] for v in ACC_V)
-        if n_acc == 0:
-            return
-        if not force and n_acc < FLUSH_ADD_EVERY:
-            return
-
-        try:
-            vecs = np.vstack(ACC_V).astype(np.float32, copy=False)
-        except ValueError as e:
-            log(f"❌ vstack hata: {e} | shapes={[v.shape for v in ACC_V]}", "WRITER", Fore.RED)
-            ACC_V.clear(); ACC_T.clear(); ACC_U.clear()
-            return
-
-        dim = vecs.shape[1]
-        with store._lock:
+        def sizes(prefix=""):
             try:
+                idx = os.path.getsize(INDEX_PATH) if os.path.exists(INDEX_PATH) else 0
+                jsl = os.path.getsize(META_JSONL) if os.path.exists(META_JSONL) else 0
+                log(f"{prefix}index={idx/1024/1024:.2f}MB jsonl={jsl/1024/1024:.2f}MB", "WRITER", Fore.CYAN)
+            except Exception as e:
+                log(f"Boyut ölçüm hatası: {e}", "WRITER", Fore.YELLOW)
+
+        def checkpoint_index():
+            # sadece FAISS’i yaz; meta’yı JSONL’ye zaten yazıyoruz
+            if store.index is None:
+                return
+            tmp = INDEX_PATH + ".tmp"
+            faiss.write_index(store.index, tmp)
+            os.replace(tmp, INDEX_PATH)
+
+        def flush_add(force=False):
+            nonlocal ACC_V, ACC_U, added
+            n_acc = sum(v.shape[0] for v in ACC_V)
+            if n_acc == 0:
+                return
+            if not force and n_acc < FLUSH_ADD_EVERY:
+                return
+
+            try:
+                vecs = np.vstack(ACC_V).astype(np.float32, copy=False)
+            except ValueError as e:
+                log(f"❌ vstack hata: {e} | shapes={[v.shape for v in ACC_V]}", "WRITER", Fore.RED)
+                ACC_V.clear(); ACC_U.clear()
+                return
+
+            dim = vecs.shape[1]
+            n   = vecs.shape[0]
+            with store._lock:
                 store._ensure_index(dim)
                 faiss.normalize_L2(vecs)
 
                 start = store._next_int_id
-                ids = np.arange(start, start + vecs.shape[0], dtype=np.int64)
-                store._next_int_id += vecs.shape[0]
+                ids   = np.arange(start, start + n, dtype=np.int64)
+                store._next_int_id += n
+
                 store.index.add_with_ids(vecs, ids)
 
-                # hafif meta
+                # JSONL: her id/url için tek satır yaz
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S")
                 for j, fid in enumerate(ids):
-                    store.meta[int(fid)] = {
-                        "external_id": os.urandom(8).hex(),
-                        "metadata": {
-                            "doc_type": DOC_TYPE,
-                            "url": ACC_U[j],
-                            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
+                    rec = {
+                        "id": int(fid),
+                        "url": ACC_U[j],
+                        "doc_type": DOC_TYPE,
+                        "created_at": now_str
                     }
+                    meta_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                meta_f.flush()              # OS buffer
+                os.fsync(meta_f.fileno())   # disk’e bastır
 
-                # >>> Yazmayı ZORLA: hemen kaydet ve boyutları kontrol et
-                try:
-                    store._save_state()
-                except Exception as e:
-                    log(f"❌ _save_state hatası: {e}", "WRITER", Fore.RED)
+            added += n
+            ACC_V.clear(); ACC_U.clear()
+            log(f"Writer: +{n} (toplam={added})", "WRITER", Fore.GREEN)
+            sizes("   ↳ ")
 
-            except Exception as e:
-                log(f"❌ flush_add iç hata: {e}", "WRITER", Fore.RED)
-                raise
+        while finished < N_WORKERS and not stop_event.is_set():
+            now = time.time()
 
-        added += vecs.shape[0]
-        ACC_V.clear(); ACC_T.clear(); ACC_U.clear()
-        last_flush = time.time()
-        log(f"Writer: +{vecs.shape[0]} (toplam={added})", "WRITER", Fore.GREEN)
-        log_sizes(prefix="   ↳ dosya boyutları: ")
+            # periyodik index checkpoint
+            if now - last_ckpt >= CKPT_EVERY_SEC:
+                checkpoint_index()
+                last_ckpt = now
 
-    while finished < N_WORKERS and not stop_event.is_set():
-        now = time.time()
+            # heartbeat
+            if now - last_hb >= 30:
+                nt = store.index.ntotal if store.index else 0
+                log(f"[HB] added={added} ntotal={nt}", "WRITER", Fore.CYAN)
+                sizes("   ↳ ")
+                last_hb = now
 
-        # Periyodik flush: dosya mutlaka yazılsın
-        if now - last_flush >= PERIODIC_FLUSH:
-            flush_add(force=True)
+            try:
+                item = in_q.get(timeout=1.0)
+            except queue.Empty:
+                # kuyruk boşsa da ara ara yaz
+                flush_add(force=True)
+                continue
 
-        # Heartbeat
-        if now - last_hb >= HEARTBEAT_EVERY:
-            nt = store.index.ntotal if store.index else 0
-            log(f"[HB] added={added} ntotal={nt}", "WRITER", Fore.CYAN)
-            log_sizes(prefix="   ↳ ")
-            last_hb = now
+            if item == WRITER_POISON:
+                log("Writer: poison", "WRITER", Fore.YELLOW)
+                break
 
-        # Kuyruktan al
+            if item is None:
+                finished += 1
+                continue
+
+            # <<< değişti: worker sadece (vecs, urls) gönderiyor
+            vecs, urls = item
+            if urls is None:
+                urls = [None] * vecs.shape[0]
+            if not isinstance(vecs, np.ndarray) or vecs.size == 0:
+                continue
+
+            ACC_V.append(np.asarray(vecs, dtype=np.float32))
+            ACC_U.extend(urls)
+
+            if sum(v.shape[0] for v in ACC_V) >= FLUSH_ADD_EVERY:
+                flush_add(force=True)
+
+        # kalanlar
+        flush_add(force=True)
+        checkpoint_index()
+
+        # kapat
         try:
-            item = in_q.get(timeout=1.0)
-        except queue.Empty:
-            continue
+            meta_f.flush()
+            os.fsync(meta_f.fileno())
+            meta_f.close()
+        except Exception:
+            pass
 
-        if item == WRITER_POISON:
-            log("Writer: poison", "WRITER", Fore.YELLOW)
-            break
-        if item is None:
-            finished += 1
-            continue
+        nt = store.index.ntotal if store.index else 0
+        log(f"✅ Writer bitti | eklenen={added} | ntotal={nt}", "WRITER", Fore.GREEN)
+        sizes("Final: ")
 
-        vecs, texts, urls = item
-        if not isinstance(vecs, np.ndarray) or vecs.size == 0:
-            log("⚠️ boş vecs geldi, atlandı", "WRITER", Fore.YELLOW)
-            continue
-
-        # hizala
-        n = vecs.shape[0]
-        if len(texts) != n or len(urls) != n:
-            texts = texts[:n]; urls = urls[:n]
-
-        ACC_V.append(np.asarray(vecs, dtype=np.float32))
-        ACC_T.extend(texts)
-        ACC_U.extend(urls)
-
-        # Eşik dolduysa yaz
-        if sum(v.shape[0] for v in ACC_V) >= FLUSH_ADD_EVERY:
-            flush_add(force=True)
-
-    # Kalan her şeyi yaz
-    flush_add(force=True)
-
-    # Final atomic (görünürlük garantisi)
-    try:
-        with store._lock:
-            flush_atomic(store)
-        log_sizes(prefix="Final: ")
     except Exception as e:
-        log(f"⚠️ Final flush_atomic hata: {e}", "WRITER", Fore.YELLOW)
-
-    nt = store.index.ntotal if store.index else 0
-    log(f"Writer bitti | eklenen={added} | ntotal={nt}", "WRITER", Fore.GREEN)
+        log(f"❌ Writer hatası: {e}", "WRITER", Fore.RED)
+        import traceback; traceback.print_exc()
 # ---- MAIN ----
 def main():
     try:
