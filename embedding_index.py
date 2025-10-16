@@ -3,8 +3,9 @@
 EmbeddingIndex – FAISS + SentenceTransformer tabanlı metin indeksleme sistemi
 - Otomatik chunking (parametrik boyut & overlap)
 - Her chunk için ayrı embedding
-- Orijinal metni meta.json içinde saklama
-- SHA1, URL, doc_type, chunk_index bilgileri dahil
+- Full text'i opsiyonel saklama (store_full_text)
+- Dim uyuşmazlığında güvenli davranış (reset yok; hata)
+- Toplu ekleme için add_vectors_bulk
 """
 
 import os
@@ -27,133 +28,188 @@ class EmbeddingIndex:
         model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         index_path: str = "faiss.index",
         meta_path: str = "meta.json",
+        store_full_text: bool = False,
+        faiss_threads: Optional[int] = None,   # None => dokunma
     ) -> None:
         self.model_name = model_name
         self.index_path = index_path
         self.meta_path = meta_path
+        self.store_full_text = store_full_text
 
-        self._lock = threading.RLock()  # Reentrant lock for better performance
+        self._lock = threading.RLock()
         self.index: Optional[faiss.IndexIDMap2] = None
-        self.meta: Dict[int, Dict[str, Any]] = {}
+        self.meta: Dict[Any, Any] = {}
         self._next_int_id: int = 1
+        self._index_dim: Optional[int] = None  # güven için
 
-        # Model loading optimized
+        # (Opsiyonel) FAISS thread ayarı
+        if faiss_threads is not None:
+            try:
+                faiss.omp_set_num_threads(int(faiss_threads))
+            except Exception:
+                pass
+
+        # Model (sadece upsert_vector/search kullanacaksanız gerekli)
         self.model = SentenceTransformer(self.model_name)
         self.model.eval()
-
-        # FAISS thread settings
-        try:
-            faiss.omp_set_num_threads(min(4, os.cpu_count() // 2))
-        except:
-            pass
 
         try:
             self._load_state()
         except Exception as e:
-            print(f"Initial load failed, starting fresh: {e}")
+            print(f"[EmbeddingIndex] initial load failed, starting fresh: {e}")
 
-    def _ensure_documents_bucket(self) -> None:
-        if "documents" not in self.meta or not isinstance(self.meta.get("documents"), dict):
-            self.meta["documents"] = {}
-    # =====================================================
-    # ✅ GENEL API
-    # =====================================================
+        self._ensure_documents_bucket()
+
+    # ====================== GENEL API ======================
 
     def upsert_vector(
-            self,
-            text: Optional[str],
-            vector: Optional[List[float]] = None,
-            external_id: Optional[str] = None,
-            metadata: Optional[Dict[str, Any]] = None,
-            int_id: Optional[int] = None,
-            chunk_size: int = 1500,
-            overlap: int = 200,
-        ) -> Dict[str, Any]:
-            if not text or not text.strip():
-                raise ValueError("Provide 'text'.")
+        self,
+        text: Optional[str],
+        vector: Optional[List[float]] = None,
+        external_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        int_id: Optional[int] = None,
+        chunk_size: int = 1500,
+        overlap: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        Tek bir text için:
+        - Full metni documents altında (opsiyonel) saklar
+        - Chunk'ları encode edip FAISS'e ekler
+        """
+        if not text or not text.strip():
+            raise ValueError("Provide 'text'.")
 
-            full_text_sha1 = self._sha1_of(text)
-            doc_id = f"doc_{full_text_sha1[:12]}"
+        full_text_sha1 = self._sha1_of(text)
+        doc_id = f"doc_{full_text_sha1[:12]}"
 
-            self._ensure_documents_bucket()
-            if doc_id in self.meta["documents"]:
-                return {"doc_ref": doc_id, "status": "exists"}
+        if doc_id in self.meta.get("documents", {}):
+            return {"doc_ref": doc_id, "status": "exists"}
 
-            # Chunking
-            t_chunk0 = time.time()
-            chunks = self._chunk_text_simple(text, size=chunk_size, overlap=overlap)
-            t_chunk1 = time.time()
-            if not chunks:
-                raise ValueError("No chunks created from text.")
+        # Chunking
+        t_chunk0 = time.time()
+        chunks = self._chunk_text_simple(text, size=chunk_size, overlap=overlap)
+        t_chunk1 = time.time()
+        if not chunks:
+            raise ValueError("No chunks created from text.")
 
-            # Store document
-            self.meta["documents"][doc_id] = {
-                "url": (metadata or {}).get("url"),
-                "full_text_sha1": full_text_sha1,
-                "full_text": text,
-                "total_chunks": len(chunks),
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
+        # Document-level meta
+        doc_meta = {
+            "url": (metadata or {}).get("url"),
+            "full_text_sha1": full_text_sha1,
+            "total_chunks": len(chunks),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "title": (metadata or {}).get("title"),
+            "doc_type": (metadata or {}).get("doc_type"),
+        }
+        if self.store_full_text:
+            doc_meta["full_text"] = text
+        self.meta["documents"][doc_id] = doc_meta
 
-            # Encode - batch optimization
-            t_enc0 = time.time()
-            chunk_texts = [c[0] for c in chunks]
-            
-            # Use larger batches for efficiency
-            vecs = self.model.encode(
-                chunk_texts, 
-                batch_size=min(256, len(chunk_texts)),
-                show_progress_bar=False,
-                convert_to_tensor=False  # Direct numpy for better performance
-            )
-            vecs = np.array(vecs, dtype=np.float32)
-            if vecs.ndim == 1:
-                vecs = vecs.reshape(1, -1)
-            t_enc1 = time.time()
+        # Encode (convert_to_numpy True => daha hızlı dönüş)
+        t_enc0 = time.time()
+        chunk_texts = [c[0] for c in chunks]
+        vecs = self.model.encode(
+            chunk_texts,
+            batch_size=min(256, max(32, len(chunk_texts))),
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,  # kozine/IP için iyi; tekrar normalize edilse de sorun değil
+        ).astype(np.float32)
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+        t_enc1 = time.time()
 
-            dim = vecs.shape[1]
-            with self._lock:
-                self._ensure_index(dim)
-                self._normalize(vecs)
+        # Add to index
+        t_add0 = time.time()
+        dim = int(vecs.shape[1])
+        with self._lock:
+            self._ensure_index(dim)
+            # emniyet: normalize tekrar (no-op sayılır)
+            faiss.normalize_L2(vecs)
 
-                # FAISS add - single operation
-                t_add0 = time.time()
-                start_id = self._next_int_id
-                ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
-                self._next_int_id += vecs.shape[0]
-                
-                self.index.add_with_ids(vecs, ids)
+            start_id = self._next_int_id
+            ids = np.arange(start_id, start_id + vecs.shape[0], dtype=np.int64)
+            self._next_int_id += vecs.shape[0]
+            self.index.add_with_ids(vecs, ids)
 
-                # Batch metadata update
-                for i, (txt, s, e, h_path) in enumerate(chunks):
-                    faiss_id = int(ids[i])
-                    self.meta[faiss_id] = {
-                        "external_id": str(uuid.uuid4()),
-                        "metadata": {
-                            "doc_ref": doc_id,
-                            "chunk_index": i,
-                            "total_chunks": len(chunks),
-                            "sha1": self._sha1_of(txt),
-                            "h_path": h_path,
-                            "char_start": s,
-                            "char_end": e,
-                        },
-                    }
-                t_add1 = time.time()
+            # chunk meta
+            for i, (txt, s, e, h_path) in enumerate(chunks):
+                faiss_id = int(ids[i])
+                self.meta[faiss_id] = {
+                    "external_id": external_id or str(uuid.uuid4()),
+                    # "text": txt,  # dosya boyutundan tasarruf için kapalı
+                    "metadata": {
+                        "doc_ref": doc_id,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "sha1": self._sha1_of(txt),
+                        "h_path": h_path,
+                        "char_start": s,
+                        "char_end": e,
+                    },
+                }
+            t_add1 = time.time()
 
-                self._save_state()
+            self._save_state()
 
-            return {
-                "doc_ref": doc_id,
-                "total_chunks": len(chunks),
-                "faiss_ids": ids.tolist(),
-                "timings": {
-                    "chunk_ms": (t_chunk1 - t_chunk0) * 1000.0,
-                    "encode_ms": (t_enc1 - t_enc0) * 1000.0,
-                    "add_ms": (t_add1 - t_add0) * 1000.0,
-                    "total_ms": (t_add1 - t_chunk0) * 1000.0,
-                },
-            }
+        return {
+            "doc_ref": doc_id,
+            "total_chunks": len(chunks),
+            "faiss_ids": ids.tolist(),
+            "timings": {
+                "chunk_ms": (t_chunk1 - t_chunk0) * 1000.0,
+                "encode_ms": (t_enc1 - t_enc0) * 1000.0,
+                "add_ms": (t_add1 - t_add0) * 1000.0,
+                "total_ms": (t_add1 - t_chunk0) * 1000.0,
+            },
+        }
+
+    def add_vectors_bulk(
+        self,
+        vecs: np.ndarray,
+        texts: Optional[List[str]] = None,
+        urls: Optional[List[Optional[str]]] = None,
+        per_chunk_meta: Optional[List[Dict[str, Any]]] = None,
+        doc_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Worker hattından hazır embedding'leri FAISS'e toplu eklemek için.
+        - vecs: (N, D) float32
+        - texts/urls: aynı uzunlukta veya None
+        - per_chunk_meta: her chunk için ek meta (opsiyonel)
+        """
+        if not isinstance(vecs, np.ndarray) or vecs.ndim != 2:
+            raise ValueError("vecs must be 2D numpy array")
+        vecs = vecs.astype(np.float32, copy=False)
+        n, dim = vecs.shape
+
+        with self._lock:
+            self._ensure_index(dim)
+            faiss.normalize_L2(vecs)
+
+            start_id = self._next_int_id
+            ids = np.arange(start_id, start_id + n, dtype=np.int64)
+            self._next_int_id += n
+            self.index.add_with_ids(vecs, ids)
+
+            for i, fid in enumerate(ids):
+                meta_obj = {
+                    "external_id": os.urandom(8).hex(),
+                    # "text": texts[i] if texts else None,  # boyut için kapalı
+                    "metadata": {
+                        "doc_type": doc_type,
+                        "url": urls[i] if urls else None,
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                }
+                if per_chunk_meta and i < len(per_chunk_meta):
+                    meta_obj["metadata"].update(per_chunk_meta[i] or {})
+                self.meta[int(fid)] = meta_obj
+
+            self._save_state()
+
+        return {"added": int(n), "faiss_ids": ids.tolist(), "dim": int(dim)}
 
     def search(
         self,
@@ -161,11 +217,12 @@ class EmbeddingIndex:
         vector: Optional[List[float]] = None,
         k: int = 5,
         simple_filter: Optional[Dict[str, Any]] = None,
+        return_text: bool = False,
     ) -> List[Dict[str, Any]]:
         if vector is None:
             if not text or not text.strip():
                 return []
-            q = self.model.encode(text, show_progress_bar=False)
+            q = self.model.encode(text, show_progress_bar=False, convert_to_numpy=True).astype(np.float32)
         else:
             q = np.array(vector, dtype=np.float32)
 
@@ -179,7 +236,7 @@ class EmbeddingIndex:
             if self.index.d != q.shape[1]:
                 raise ValueError(f"Query dim {q.shape[1]} != index dim {self.index.d}")
 
-            self._normalize(q)
+            faiss.normalize_L2(q)
             scores, ids = self.index.search(q, int(k))
 
             results = []
@@ -193,20 +250,26 @@ class EmbeddingIndex:
                 if simple_filter and not self._passes_filter(meta, simple_filter):
                     continue
 
-                results.append({
+                out = {
                     "id": int(idx),
                     "score": float(scores[0][i]),
                     "external_id": meta.get("external_id"),
-                    "text": meta.get("text"),
                     "metadata": meta.get("metadata", {}),
-                })
+                }
+                if return_text:
+                    out["text"] = meta.get("text")  # metin tutulmuyorsa None gelir
+                results.append(out)
 
         return results
-    def ingest_markdown(self,url: str,raw_markdown: str,doc_type: str = "service",chunk_size: int = 1500,overlap: int = 200,) -> Dict[str, Any]:
-        """
-        Markdown dokümanı temizleyip upsert_vector ile indeksler.
-        Full text sadece documents altında tutulur; chunk'lar doc_ref ile bağlanır.
-        """
+
+    def ingest_markdown(
+        self,
+        url: str,
+        raw_markdown: str,
+        doc_type: str = "service",
+        chunk_size: int = 1500,
+        overlap: int = 200,
+    ) -> Dict[str, Any]:
         if not self._is_valid_url(url):
             raise ValueError("invalid url")
 
@@ -214,11 +277,9 @@ class EmbeddingIndex:
         if not clean_md.strip():
             raise ValueError("empty markdown after cleaning")
 
-        # Başlık (opsiyonel)
         m = re.search(r"(?m)^#\s+(.+)$", clean_md)
         title = m.group(1).strip() if m else None
 
-        # upsert_vector tüm chunk + meta işini halleder
         res = self.upsert_vector(
             text=clean_md,
             metadata={"url": url, "doc_type": doc_type.lower(), "title": title},
@@ -226,54 +287,40 @@ class EmbeddingIndex:
             overlap=overlap,
         )
 
-        # Dönüş payload'ı (uyumlu ve özet)
-        doc_ref = res.get("doc_ref")
-        total_chunks = res.get("total_chunks")
         dim = self.index.d if self.index is not None else None
-
         return {
             "success": True,
             "page": {"url": url, "title": title, "language": "tr"},
-            "doc_ref": doc_ref,
-            "total_chunks": total_chunks,
+            "doc_ref": res.get("doc_ref"),
+            "total_chunks": res.get("total_chunks"),
             "model": {"name": self.model_name, "dim": dim, "emb_ver": time.strftime("%Y-%m-%d")},
         }
 
-    # =====================================================
-    # 🧠 TEXT YARDIMCILARI
-    # =====================================================
+    # =================== TEXT YARDIMCILARI ===================
 
     @staticmethod
     def clean_markdown(md: str) -> str:
-        """Basit markdown temizleyici"""
         out = md.replace("\r\n", "\n").replace("\r", "\n")
-        out = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", out)  # görselleri sil
-        out = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", out)  # linkleri text'e çevir
-        out = re.sub(r"https?://\S+", "", out)  # çıplak URL sil
+        out = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", out)
+        out = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", out)
+        out = re.sub(r"https?://\S+", "", out)
         return out.strip()
 
-
-    def _chunk_text_simple(self, text: str, size: int = 1500, overlap: int = 200) -> List[Tuple[str, int, int, List[str]]]:
-        """
-        Düz metni sabit boyutlu parçalara böler.
-        Her parça 4-tuple döner: (chunk_text, char_start, char_end, h_path)
-        """
+    def _chunk_text_simple(
+        self, text: str, size: int = 1500, overlap: int = 200
+    ) -> List[Tuple[str, int, int, List[str]]]:
         chunks: List[Tuple[str, int, int, List[str]]] = []
         n = len(text)
         start = 0
-        step = max(1, size - overlap)  # overlap >= size olursa kilitlenmesin
-
+        step = max(1, size - overlap)
         while start < n:
             end = min(n, start + size)
             chunk_text = text[start:end]
             chunks.append((chunk_text, start, end, ["# Loose"]))
             start += step
-
         return chunks
 
-    # =====================================================
-    # 🔐 İÇ YARDIMCILAR
-    # =====================================================
+    # =================== İÇ YARDIMCILAR ===================
 
     @staticmethod
     def _normalize(a: np.ndarray) -> np.ndarray:
@@ -281,6 +328,12 @@ class EmbeddingIndex:
         return a
 
     def _save_state(self) -> None:
+        # genel bilgi başlığı
+        self.meta["_info"] = {
+            "model_name": self.model_name,
+            "dim": self.index.d if self.index is not None else self._index_dim,
+            "created_or_updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in self.meta.items()}, f, ensure_ascii=False, indent=2)
         if self.index is not None:
@@ -297,29 +350,40 @@ class EmbeddingIndex:
                     self.meta[ik] = v
                 except Exception:
                     self.meta[k] = v
+            # önceki info
+            if "_info" in self.meta:
+                self._index_dim = self.meta["_info"].get("dim")
         else:
             self.meta = {}
 
         if os.path.exists(self.index_path):
             self.index = faiss.read_index(self.index_path)
+            self._index_dim = self.index.d
         else:
             self.index = None
 
-        # sadece sayısal id'lere bakarak next id belirle
         numeric_keys = [k for k in self.meta.keys() if isinstance(k, int)]
         self._next_int_id = (max(numeric_keys) + 1) if numeric_keys else 1
 
+        self._ensure_documents_bucket()
+
+    def _ensure_documents_bucket(self) -> None:
+        if "documents" not in self.meta or not isinstance(self.meta.get("documents"), dict):
+            self.meta["documents"] = {}
 
     def _ensure_index(self, dim: int) -> None:
         if self.index is None:
             base = faiss.IndexFlatIP(dim)
             self.index = faiss.IndexIDMap2(base)
-        elif self.index.d != dim:
-            base = faiss.IndexFlatIP(dim)
-            self.index = faiss.IndexIDMap2(base)
-            self.meta.clear()
-            self._next_int_id = 1
-            self._save_state()
+            self._index_dim = dim
+        else:
+            if self.index.d != dim:
+                # Daha önce burada index ve meta resetleniyordu (riskli)
+                # Bunun yerine açık hata fırlatıyoruz.
+                raise ValueError(
+                    f"Index dimension mismatch: existing={self.index.d}, incoming={dim}. "
+                    f"Lütfen tek boyutlu index kullanın (aynı encoder)."
+                )
 
     @staticmethod
     def _sha1_of(s: str) -> str:
@@ -340,3 +404,19 @@ class EmbeddingIndex:
                 if item_meta.get(key) != val:
                     return False
         return True
+
+    # -------------------- faydalı ekler --------------------
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            meta_size = os.path.getsize(self.meta_path) if os.path.exists(self.meta_path) else 0
+            idx_size  = os.path.getsize(self.index_path) if os.path.exists(self.index_path) else 0
+            return {
+                "ntotal": (self.index.ntotal if self.index is not None else 0),
+                "dim": (self.index.d if self.index is not None else self._index_dim),
+                "meta_size_bytes": meta_size,
+                "index_size_bytes": idx_size,
+                "documents": len(self.meta.get("documents", {})),
+                "next_id": self._next_int_id,
+                "model_name": self.model_name,
+            }
