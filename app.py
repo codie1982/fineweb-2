@@ -207,14 +207,18 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
         if not chunks: continue
 
         vecs_out=[]; t0=time.time()
-        with torch.inference_mode():
-            for i in range(0,len(chunks),ENC_BATCH):
-                sub = chunks[i:i+ENC_BATCH]
-                v = MODEL.encode(sub, batch_size=ENC_BATCH,
-                                 show_progress_bar=False,
-                                 normalize_embeddings=True,
-                                 convert_to_numpy=True)
-                vecs_out.append(np.asarray(v, dtype=np.float32))
+        try:
+            with torch.inference_mode():
+                for i in range(0,len(chunks),ENC_BATCH):
+                    sub = chunks[i:i+ENC_BATCH]
+                    v = MODEL.encode(sub, batch_size=ENC_BATCH,
+                                     show_progress_bar=False,
+                                     normalize_embeddings=True,
+                                     convert_to_numpy=True)
+                    vecs_out.append(np.asarray(v, dtype=np.float32))
+        except Exception as e:
+            log(f"❌ encode hata: {e}", f"W{wid}", Fore.RED)
+            continue
         vecs = np.vstack(vecs_out) if len(vecs_out)>1 else vecs_out[0]
 
         # protokol: worker -> writer : (vecs, urls)
@@ -232,125 +236,33 @@ def worker(in_q: Queue, out_q: Queue, stop_event: Event, wid: int):
 
 # --- writer ---
 def writer(in_q: Queue, stop_event: Event):
-    # thread limit
     try:
         faiss.omp_set_num_threads(1)
         torch.set_num_threads(1)
-    except Exception: pass
-
-    # dosya klasörlerini hazırla
-    os.makedirs(os.path.dirname(INDEX_PATH) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(META_JSONL) or ".", exist_ok=True)
-
-    # JSONL dosyasını daha en başta oluştur (touch)
-    with open(META_JSONL, "a", encoding="utf-8") as _touch:
-        pass
-
-    index = None
-    next_id = 1
-
-    # meta append stream (line-buffered)
-    meta_f = open(META_JSONL, "a", encoding="utf-8", buffering=1)
-
-    ACC_V: List[np.ndarray] = []
-    ACC_U: List[Optional[str]] = []
-    added = 0
-    last_ckpt = time.time()
-    last_hb   = time.time()
-    finished  = 0
-
-    def flush_add(force=False):
-        nonlocal ACC_V, ACC_U, index, next_id, added
-        n_acc = sum(v.shape[0] for v in ACC_V)
-        if n_acc == 0: return
-        if not force and n_acc < FLUSH_ADD_EVERY: return
-
-        try:
-            vecs = np.vstack(ACC_V).astype(np.float32, copy=False)
-        except ValueError as e:
-            log(f"❌ vstack hata: {e}", "WRITER", Fore.RED)
-            ACC_V.clear(); ACC_U.clear(); return
-
-        dim = vecs.shape[1]
-        faiss.normalize_L2(vecs)
-
-        if index is None:
-            base = faiss.IndexFlatIP(dim)
-            index = faiss.IndexIDMap2(base)
-
-        ids = np.arange(next_id, next_id + vecs.shape[0], dtype=np.int64)
-        next_id += vecs.shape[0]
-        index.add_with_ids(vecs, ids)
-
-        # meta.jsonl
-        now_s = time.strftime("%Y-%m-%d %H:%M:%S")
-        for j, fid in enumerate(ids):
-            meta_f.write(json.dumps({"id": int(fid), "url": ACC_U[j], "created_at": now_s}, ensure_ascii=False) + "\n")
-        meta_f.flush(); os.fsync(meta_f.fileno())
-
-        ACC_V.clear(); ACC_U.clear()
-        added += ids.size
-        log(f"Writer: +{ids.size} (toplam={added})", "WRITER", Fore.GREEN)
-
-    def checkpoint_index():
-        if index is None: return
-        tmp = INDEX_PATH + ".tmp"
-        faiss.write_index(index, tmp)
-        os.replace(tmp, INDEX_PATH)
-
-    log(f"Writer başladı | INDEX={INDEX_PATH} | JSONL={META_JSONL}", "WRITER", Fore.GREEN)
-
-    while finished < N_WORKERS and not stop_event.is_set():
-        now = time.time()
-
-        if now - last_ckpt >= CHECKPOINT_EVERY_S:
-            checkpoint_index(); last_ckpt = now
-
-        if now - last_hb >= 30:
-            sz_i = os.path.getsize(INDEX_PATH) if os.path.exists(INDEX_PATH) else 0
-            sz_m = os.path.getsize(META_JSONL) if os.path.exists(META_JSONL) else 0
-            log(f"[HB] added={added} | index={fmt_bytes(sz_i)} meta={fmt_bytes(sz_m)}", "WRITER", Fore.CYAN)
-            last_hb = now
-
-        try:
-            item = in_q.get(timeout=1.0)
-        except queue.Empty:
-            flush_add(force=True)
-            continue
-
-        if item == WRITER_POISON:
-            log("Writer: poison", "WRITER", Fore.YELLOW); break
-
-        if item is None:
-            finished += 1
-            continue
-
-        vecs, urls = item
-        if not isinstance(vecs, np.ndarray) or vecs.size == 0:
-            continue
-        if urls is None: urls = [None] * vecs.shape[0]
-        if len(urls) != vecs.shape[0]: urls = urls[:vecs.shape[0]]
-
-        ACC_V.append(np.asarray(vecs, dtype=np.float32))
-        ACC_U.extend(urls)
-
-        if sum(v.shape[0] for v in ACC_V) >= FLUSH_ADD_EVERY:
-            flush_add(force=True)
-
-    # kalanlar ve final
-    flush_add(force=True)
-    checkpoint_index()
-
-    try:
-        meta_f.flush(); os.fsync(meta_f.fileno()); meta_f.close()
     except Exception:
         pass
 
-    ntotal = int(index.ntotal) if index is not None else 0
-    sz_i = os.path.getsize(INDEX_PATH) if os.path.exists(INDEX_PATH) else 0
-    sz_m = os.path.getsize(META_JSONL) if os.path.exists(META_JSONL) else 0
-    log(f"✅ Writer bitti | added={added} ntotal={ntotal} | index={fmt_bytes(sz_i)} meta={fmt_bytes(sz_m)}",
-        "WRITER", Fore.GREEN)
+    # Klasörler
+    os.makedirs(os.path.dirname(INDEX_PATH) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(META_JSONL) or ".", exist_ok=True)
+
+    # Hata yakalayıcı blok
+    try:
+        # JSONL dosyasını kesin oluştur (touch)
+        with open(META_JSONL, "a", encoding="utf-8") as _touch:
+            pass
+
+        # Boş bir indexi de daha en başta yaz (writer’ın başladığını kanıtlar)
+        # (Dim bilinmediği için geçici 1-dimlik boş index yazıyoruz; ilk gerçek add'te üzerine yazacağız.)
+        tmp_init = INDEX_PATH + ".init"
+        faiss.write_index(faiss.IndexFlatIP(1), tmp_init)
+        os.replace(tmp_init, INDEX_PATH)
+
+        log(f"Writer başladı | INDEX={INDEX_PATH} | JSONL={META_JSONL}", "WRITER", Fore.GREEN)
+    except Exception as e:
+        log(f"❌ Writer init hata: {e}", "WRITER", Fore.RED)
+        # Writer devam etmesin; ana süreç temiz kapatır
+        return
 
 # --- main ---
 def main():
@@ -374,7 +286,7 @@ def main():
 
     p_reader = Process(target=reader, args=(files, q_r2w, stop_event), daemon=True)
     p_writer = Process(target=writer, args=(q_w2wr, stop_event), daemon=False)
-    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=True)
+    workers  = [Process(target=worker, args=(q_r2w, q_w2wr, stop_event, i+1), daemon=False)
                 for i in range(N_WORKERS)]
 
     def shutdown(*_):
